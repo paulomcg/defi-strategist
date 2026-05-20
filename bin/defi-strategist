@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Launcher — runs the CLI module from the repo root.
+set -e
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PYTHONPATH="$ROOT" exec python3 -m scripts.cli "$@"

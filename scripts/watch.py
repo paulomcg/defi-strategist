@@ -1,0 +1,229 @@
+"""Watch loop — monitor mode.
+
+Cycle body (every interval seconds):
+    1. fetch user DeFi positions across configured chains
+    2. fetch opportunities (search/list) on watched tokens
+    3. normalize both into stable shapes
+    4. evaluate rules → list of Alerts
+    5. append cycle record to audit log (and stdout JSONL)
+    6. sleep
+
+Pure read-only. No on-chain actions. Future versions will add an
+executor + decision hook for rotation / claim-compound / rebalance.
+"""
+
+from __future__ import annotations
+
+import json
+import signal
+import sys
+import time
+from datetime import datetime, timezone
+from typing import Any, TextIO
+from uuid import uuid4
+
+from . import audit, rules as rules_engine
+from .onchain_defi import DefiAdapter, DefiError, normalize_product
+
+_DEFAULT_INTERVAL = 60
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def run_monitor(
+    *,
+    address: str | None,
+    chains: list[str],
+    watch_tokens: list[str],
+    watch_platforms: list[str],
+    rules_config: list[dict[str, Any]],
+    interval_seconds: int = _DEFAULT_INTERVAL,
+    iterations: int | None = None,
+    sink: TextIO | None = None,
+    sleep_fn=time.sleep,
+    adapter: DefiAdapter | None = None,
+) -> dict[str, Any]:
+    """Run the monitor loop. Returns a summary dict on exit.
+
+    `address` may be None — in that case only opportunity scanning runs
+    (no position fetch). Useful for "scan-only" mode where the user
+    wants to surface yield opportunities without exposing a wallet.
+    """
+    sink = sink or sys.stdout
+    adapter = adapter or DefiAdapter()
+    cycles = 0
+    alerts_total = 0
+    interrupted = False
+
+    def _on_sigint(signum, frame):  # noqa: ARG001
+        nonlocal interrupted
+        interrupted = True
+
+    prev_sigint = signal.signal(signal.SIGINT, _on_sigint)
+    audit.append({
+        "event": "monitor.start",
+        "address": address,
+        "chains": chains,
+        "watch_tokens": watch_tokens,
+        "watch_platforms": watch_platforms,
+        "rules_count": len(rules_config),
+        "interval_seconds": interval_seconds,
+        "iterations_cap": iterations,
+    })
+    try:
+        while True:
+            if interrupted:
+                break
+            cycle_id = uuid4().hex
+            cycle = {
+                "cycle_id": cycle_id,
+                "cycle_index": cycles,
+                "ts_utc": _now(),
+                "errors": [],
+            }
+            positions = _fetch_positions(adapter, address, chains, cycle)
+            opportunities = _fetch_opportunities(
+                adapter, watch_tokens, watch_platforms, chains, cycle
+            )
+            cycle["positions"] = positions
+            cycle["opportunities_count"] = len(opportunities)
+            alerts = rules_engine.evaluate(
+                positions=positions,
+                opportunities=opportunities,
+                rules=rules_config,
+            )
+            cycle["alerts"] = [a.as_dict() for a in alerts]
+            alerts_total += len(alerts)
+
+            sink.write(json.dumps(cycle, default=str) + "\n")
+            sink.flush()
+            audit.append({"event": "monitor.cycle", **cycle})
+            cycles += 1
+
+            if iterations is not None and cycles >= iterations:
+                break
+            if interrupted:
+                break
+            sleep_fn(interval_seconds)
+    finally:
+        signal.signal(signal.SIGINT, prev_sigint)
+
+    summary = {
+        "ok": True,
+        "iterations": cycles,
+        "alerts_total": alerts_total,
+        "interrupted": interrupted,
+    }
+    audit.append({"event": "monitor.end", **summary})
+    return summary
+
+
+# ---- helpers ----
+
+def _fetch_positions(
+    adapter: DefiAdapter,
+    address: str | None,
+    chains: list[str],
+    cycle: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if not address or not chains:
+        return []
+    try:
+        data = adapter.positions(address=address, chains=",".join(chains))
+    except DefiError as e:
+        cycle["errors"].append({"kind": "positions_fetch", "detail": str(e)})
+        return []
+    return _flatten_positions(data)
+
+
+def _fetch_opportunities(
+    adapter: DefiAdapter,
+    tokens: list[str],
+    platforms: list[str],
+    chains: list[str],
+    cycle: dict[str, Any],
+) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    chain_args: list[str | None] = chains or [None]
+    if tokens:
+        for tok in tokens:
+            for ch in chain_args:
+                try:
+                    items = adapter.search(token=tok, chain=ch)
+                except DefiError as e:
+                    cycle["errors"].append(
+                        {"kind": "search_failed", "token": tok, "chain": ch, "detail": str(e)}
+                    )
+                    continue
+                out.extend(normalize_product(p) for p in items)
+    if platforms:
+        for plat in platforms:
+            for ch in chain_args:
+                try:
+                    items = adapter.search(platform=plat, chain=ch)
+                except DefiError as e:
+                    cycle["errors"].append(
+                        {"kind": "search_failed", "platform": plat, "chain": ch, "detail": str(e)}
+                    )
+                    continue
+                out.extend(normalize_product(p) for p in items)
+    # Dedup by (platform, name, chain)
+    seen: set[tuple] = set()
+    deduped: list[dict[str, Any]] = []
+    for opp in out:
+        key = (opp.get("platform"), opp.get("name"), opp.get("chain"))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(opp)
+    return deduped
+
+
+def _flatten_positions(positions_data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Flatten OnChainOS positions response into a list of per-protocol holdings.
+
+    The actual response shape varies — when no positions, returns
+    {"assetStatus": 1}. When holdings exist, returns nested
+    walletIdPlatformList / platformList structures. This helper
+    is permissive and best-effort; future versions will tighten as we
+    see more real-world shapes.
+    """
+    out: list[dict[str, Any]] = []
+    if not isinstance(positions_data, dict):
+        return out
+    # Possible shapes:
+    #   {"assetStatus": 1, "updateAt": ...}            (no positions)
+    #   {"walletIdPlatformList": [{ ... }, ...]}
+    #   {"platformList": [{ ... }, ...]}
+    candidates: list[dict[str, Any]] = []
+    for key in ("walletIdPlatformList", "platformList"):
+        v = positions_data.get(key)
+        if isinstance(v, list):
+            candidates.extend(v)
+    for platform in candidates:
+        plat_name = platform.get("platformName") or platform.get("platform") or "?"
+        for inv in platform.get("investmentList") or platform.get("list") or []:
+            out.append({
+                "platform": plat_name,
+                "platform_id": platform.get("platformId"),
+                "chain": inv.get("chainName") or inv.get("chain") or platform.get("chainName"),
+                "name": inv.get("investmentName") or inv.get("name") or "?",
+                "investment_id": inv.get("investmentId") or inv.get("id"),
+                "apy_pct": _pct(inv.get("rate") or inv.get("apy")),
+                "value_usd": _f(inv.get("totalValue") or inv.get("usdValue")),
+                "raw": inv,
+            })
+    return out
+
+
+def _f(v: Any) -> float:
+    try:
+        return float(v) if v is not None else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _pct(v: Any) -> float:
+    return _f(v) * 100.0

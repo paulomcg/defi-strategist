@@ -1,0 +1,34 @@
+# Portfolio health monitor — for an actively deployed DeFi wallet.
+#
+# Pass `--address <wallet>` to make this work against a real position
+# set. The rules below catch the three most common silent failures:
+# yield decay (lender lowered APY), concentration risk (one protocol
+# eating the portfolio), and rotation opportunities (someone else is
+# paying more for the same exposure).
+
+name: portfolio-health
+chains:
+  - solana
+  - ethereum
+  - base
+
+# Tokens you actively yield-farm. Used for the opportunity_above check.
+watch_tokens:
+  - USDC
+  - USDT
+  - WETH
+  - SOL
+
+rules:
+  - id: yields-falling
+    type: min_apy_floor
+    threshold_pct: 3.0
+    severity: warn
+  - id: protocol-concentration
+    type: max_protocol_concentration
+    threshold_pct: 50.0
+    severity: warn
+  - id: better-yield-elsewhere
+    type: opportunity_above
+    threshold_pct: 8.0
+    severity: info

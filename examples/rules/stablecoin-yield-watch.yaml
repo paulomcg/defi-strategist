@@ -1,0 +1,28 @@
+# Stablecoin yield monitor — opportunity scanner.
+#
+# No `address` configured, so the loop runs in scan-only mode (no
+# position fetch). Polls USDC/USDT yields across Solana + Ethereum,
+# fires an `opportunity_above_threshold` alert when any product exceeds
+# 5% APY. Useful as a "where should my idle stables be parked?" tool.
+
+name: stablecoin-yield-watch
+chains:
+  - solana
+  - ethereum
+
+# Scan these tokens every cycle
+watch_tokens:
+  - USDC
+  - USDT
+  - DAI
+
+# Optional: scan specific platforms too (uncomment to enable)
+# watch_platforms:
+#   - Aave V3
+#   - Morpho
+
+rules:
+  - id: surface-strong-stables
+    type: opportunity_above
+    threshold_pct: 5.0
+    severity: info

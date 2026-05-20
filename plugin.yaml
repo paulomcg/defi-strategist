@@ -1,0 +1,24 @@
+name: defi-strategist
+version: 0.1.0
+description: >
+  Strategy + observability layer over OnChainOS DeFi primitives. Monitors
+  user DeFi positions, scans yield opportunities, fires structured alerts
+  on user-defined rules. v0.1 is read-only — no on-chain actions.
+author: paulomcg
+license: MIT
+entrypoint: ./bin/defi-strategist
+runtime: python3
+requires:
+  - onchainos
+python_packages:
+  - pyyaml
+tags:
+  - defi
+  - yield
+  - monitoring
+  - observability
+  - okx-onchainos
+links:
+  source: https://github.com/paulomcg/defi-strategist
+  companion_portfolio_manager: https://github.com/paulomcg/portfolio-manager
+  companion_backtester: https://github.com/paulomcg/strategy-backtester
