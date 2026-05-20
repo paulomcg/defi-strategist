@@ -92,6 +92,55 @@ class DefiExecutor:
             },
         )
 
+    def redeem(
+        self,
+        *,
+        investment_id: str,
+        ratio: str = "1",
+        receipt_token_address: str | None = None,
+        receipt_symbol: str | None = None,
+        amount_human: str | None = None,
+        precision: int | None = None,
+        slippage: str = "0.01",
+        biz_type: str = "defi",
+    ) -> dict[str, Any]:
+        """Redeem a position. Full exit by default (`ratio="1"`);
+        partial exits require either `(receipt_token_address, amount_human,
+        precision)` triple OR a user-input JSON via the underlying
+        `defi redeem --user-input`.
+
+        Used by the rollback path: when step N of a multi-step loop
+        fails, walk back through completed steps 1..N-1 and call
+        `redeem(ratio="1")` for each to exit the intermediate positions.
+        """
+        argv = [
+            "defi", "redeem",
+            "--id", investment_id,
+            "--address", self.address,
+            "--chain", self.chain,
+            "--slippage", slippage,
+        ]
+        if amount_human and receipt_token_address and precision is not None:
+            # Partial exit via single-token shorthand
+            argv += ["--token", receipt_token_address, "--amount", amount_human, "--precision", str(precision)]
+            if receipt_symbol:
+                argv += ["--symbol", receipt_symbol]
+        else:
+            # Full exit
+            argv += ["--ratio", ratio]
+        return self._build_and_submit(
+            action="redeem",
+            build_argv=argv,
+            biz_type=biz_type,
+            meta={
+                "investment_id": investment_id,
+                "ratio": ratio,
+                "receipt_token_address": receipt_token_address,
+                "receipt_symbol": receipt_symbol,
+                "amount_human": amount_human,
+            },
+        )
+
     def reinvest(
         self,
         *,

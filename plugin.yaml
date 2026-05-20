@@ -1,13 +1,15 @@
 name: defi-strategist
-version: 0.2.0
+version: 0.3.0
 description: >
   Strategy + observability layer over OnChainOS DeFi primitives.
-  v0.2 adds COMPOSABLE LOOP DISCOVERY (`discover` enumerates 1- and
-  2-step yield loops across protocols, e.g. SOL → Marinade → mSOL →
-  Solayer restake) and on-demand loop execution (`run-loop` drives the
-  full sequence via the same --live / --dry-run-actions safety gates).
-  Includes opportunity scanning, position monitoring, alert rules,
-  auto-compound, and the loop discoverer/executor.
+  v0.3 ships full DYNAMIC GRAPH DISCOVERY (builds a token-edge graph
+  from `defi detail` lpToken/underlyingToken — no hardcoded receipt
+  map needed), RISK SCORING (APY volatility + TVL stability via
+  `rate-chart` + `tvl-chart`), N-step LOOP EXECUTION with receipt-
+  balance polling between steps, and ROLLBACK on partial failure
+  (best-effort `defi redeem` walk-back of completed legs). Includes
+  opportunity scanning, position monitoring, alert rules,
+  auto-compound, and all v0.2 capabilities.
 author: paulomcg
 license: MIT
 entrypoint: ./bin/defi-strategist

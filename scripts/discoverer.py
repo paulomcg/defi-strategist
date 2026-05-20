@@ -38,7 +38,9 @@ from dataclasses import dataclass, asdict, field
 from typing import Any
 
 from .composability import find_receipt
+from .graph import Edge, TokenGraph, build_graph, find_loops
 from .onchain_defi import DefiAdapter, DefiError, normalize_product
+from .risk import score_loop_breakdowns, score_step
 
 
 @dataclass
@@ -66,6 +68,10 @@ class Loop:
     `loop_id` is a stable hash of the step inventory — same loop on
     different runs gets the same id, so it can be referenced from
     `run-loop --loop-id <id>`.
+
+    `risk` is populated by `attach_risk_scores()` when the caller
+    opts in (--with-risk). Defaults to None to avoid the expensive
+    chart fetches on every discover call.
     """
     loop_id: str
     base_asset: str
@@ -73,9 +79,10 @@ class Loop:
     steps: list[Step]
     combined_apy_pct: float
     notes: str = ""
+    risk: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        d = {
             "loop_id": self.loop_id,
             "base_asset": self.base_asset,
             "chain": self.chain,
@@ -84,6 +91,109 @@ class Loop:
             "notes": self.notes,
             "steps": [s.as_dict() for s in self.steps],
         }
+        if self.risk is not None:
+            d["risk"] = self.risk
+        return d
+
+
+def attach_risk_scores(loops: list[Loop], adapter: DefiAdapter) -> None:
+    """For each loop, fetch per-step rate-chart + tvl-chart and
+    compute risk scores. Mutates the loops in place. Caller controls
+    when this runs because it's the expensive part of discovery
+    (one chart-pair fetch per step, per loop, uncached on first call).
+    """
+    # Cache per-step risk scores so the same product across multiple
+    # loops only gets scored once.
+    step_cache: dict[str, Any] = {}
+    for lp in loops:
+        per_step = []
+        for s in lp.steps:
+            cache_key = f"{s.chain}:{s.investment_id}"
+            if cache_key in step_cache:
+                per_step.append(step_cache[cache_key])
+                continue
+            bd = score_step(
+                investment_id=str(s.investment_id or ""),
+                platform=s.platform,
+                chain=s.chain,
+                adapter=adapter,
+                has_rate_chart=bool((s.raw or {}).get("has_rate_chart", True)),
+                has_tvl_chart=bool((s.raw or {}).get("has_tvl_chart", True)),
+            )
+            step_cache[cache_key] = bd
+            per_step.append(bd)
+        lp.risk = score_loop_breakdowns(per_step)
+
+
+def discover_loops_v3(
+    *,
+    base_asset: str,
+    chains: list[str],
+    adapter: DefiAdapter,
+    max_steps: int = 3,
+    min_tvl_usd: float = 100_000.0,
+    min_step_apy_pct: float = 0.5,
+    include_single_step: bool = True,
+    max_products_per_chain: int = 200,
+    on_progress=None,
+) -> tuple[list[Loop], TokenGraph]:
+    """v0.3: build a dynamic token-edge graph from OnChainOS `defi
+    detail` lpToken/underlyingToken fields, then enumerate all loops
+    of length 1..max_steps starting from `base_asset` on each chain.
+
+    Returns the list of Loops (sorted by combined APY descending) and
+    the underlying TokenGraph so callers can inspect / reuse it.
+
+    Differences vs v0.2 `discover_loops`:
+      - No hardcoded RECEIPT_MAP dependency. Every edge is grounded
+        in OnChainOS-native data.
+      - Supports `max_steps >= 3` (v0.2 was hard-capped at 2).
+      - Returns the graph for inspection / debugging.
+    """
+    graph = build_graph(
+        adapter=adapter,
+        chains=chains,
+        seed_tokens=[base_asset],
+        max_products_per_chain=max_products_per_chain,
+        on_progress=on_progress,
+    )
+    loops: list[Loop] = []
+    for chain in chains:
+        for path in find_loops(
+            graph,
+            base_asset=base_asset,
+            chain=chain,
+            max_steps=max_steps,
+            min_step_apy_pct=min_step_apy_pct,
+            min_step_tvl_usd=min_tvl_usd,
+        ):
+            if not include_single_step and len(path) < 2:
+                continue
+            steps = [_edge_to_step(e) for e in path]
+            loops.append(_mk_loop(base_asset, chain, steps))
+    loops.sort(key=lambda lp: lp.combined_apy_pct, reverse=True)
+    return loops, graph
+
+
+def _edge_to_step(e: Edge) -> Step:
+    """Bridge from graph.Edge to discoverer.Step."""
+    return Step(
+        investment_id=e.investment_id,
+        platform=e.platform,
+        chain=e.chain,
+        input_token=e.underlying_symbol,
+        output_token=e.receipt_symbol,
+        apy_pct=e.apy_pct,
+        tvl_usd=e.tvl_usd,
+        raw={
+            "platform_id": e.platform_id,
+            "underlying_address": e.underlying_address,
+            "receipt_address": e.receipt_address,
+            "rate_details": e.rate_details,
+            "has_rate_chart": e.has_rate_chart,
+            "has_tvl_chart": e.has_tvl_chart,
+        },
+    )
 
 
 def discover_loops(

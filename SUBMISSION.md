@@ -4,7 +4,7 @@
 **Submitted by:** Paulo Goncalves
 **OnChainOS as primary data + trading source:** ✅ (every API call is a
 subprocess of `onchainos defi *`)
-**Status:** v0.2.0 — monitor + auto-compound + composable loop discovery + on-demand execution. Companion to
+**Status:** v0.3.0 — dynamic graph discovery + risk scoring + N-step execution + rollback. Companion to
 [`portfolio-manager`](https://github.com/paulomcg/portfolio-manager)
 + [`strategy-backtester`](https://github.com/paulomcg/strategy-backtester)
 
@@ -31,9 +31,12 @@ actions to drive write operations.
 | `max_protocol_concentration` rule — alert when one platform exceeds X% of DeFi value | `scripts/rules.py:_max_concentration` |
 | `opportunity_above` rule — surface yield-rotation candidates not already held | `scripts/rules.py:_opportunity_above` |
 | `auto_compound` rule — emit `claim` (and optional `reinvest`) actions when pending rewards exceed threshold | `scripts/rules.py:_auto_compound` |
-| Composable loop discoverer — enumerate 1- and 2-step yield compositions across protocols (LST → restake patterns) | `scripts/discoverer.py:discover_loops` |
-| Receipt-token map — curated (chain, platform, deposit) → receipt mappings for Solana / Ethereum / Base LSTs | `scripts/composability.py` |
-| Loop executor with receipt-balance polling between steps in live mode | `scripts/loop_executor.py` |
+| Composable loop discoverer — enumerate 1-step through N-step yield compositions across protocols (LST → restake, lending → collateral, etc.) | `scripts/discoverer.py:discover_loops_v3` |
+| **Dynamic graph builder** — derives token-edge graph from OnChainOS `defi detail`'s lpToken/underlyingToken fields. No hardcoded receipt map needed; new protocols surface automatically | `scripts/graph.py:build_graph` |
+| **Risk scoring engine** — APY volatility (`rate-chart`) + TVL stability (`tvl-chart`) → 0-100 composite. Loop score = weakest-link min | `scripts/risk.py` |
+| Receipt-token map — kept as v0.2 fallback (override path via `--legacy-receipt-map`) | `scripts/composability.py` |
+| N-step loop executor with receipt-balance polling between steps in live mode | `scripts/loop_executor.py:LoopExecutor.run` |
+| **Rollback on partial failure** — best-effort `defi redeem` walk-back of completed legs in reverse order; failures during rollback are logged but don't abort the cleanup chain | `scripts/loop_executor.py:LoopExecutor._rollback` |
 | Three example rule configs: scan-only, portfolio-health, auto-compound | `examples/rules/` |
 | Six CLI verbs: `watch`, `positions`, `scan`, `audit`, `discover`, `run-loop` | `scripts/cli.py` |
 
@@ -67,20 +70,36 @@ $ defi-strategist watch --config rules.yaml --address $W --live
 # (broadcast via wallet contract-call)
 ```
 
-**Evidence — loop discovery on real OnChainOS data:**
+**Evidence — v0.3 dynamic discovery + risk scoring on real OnChainOS data:**
 
 ```sh
-$ defi-strategist discover --token SOL --chains solana --top 5 --min-step-apy 0 --composed-only
-# returns 4 real 2-step LST→restake compositions on Solana:
-#   [4b8b976e] combined=6.20%  Marinade Finance[SOL→mSOL] → Solayer[mSOL→mSOL]
-#   [890b64a1] combined=5.62%  Jito[SOL→JitoSOL] → Solayer[JitoSOL→JitoSOL]
-#   [96bf0c41] combined=5.26%  Kamino/Jito Pool[SOL→JitoSOL] → Solayer[JitoSOL→JitoSOL]
-#   [5a044dcb] combined=4.89%  Kamino/Marinade Pool[SOL→mSOL] → Solayer[mSOL→mSOL]
+$ defi-strategist discover --token SOL --chains solana --max-products-per-chain 8 \
+    --max-steps 3 --top 5 --min-step-apy 0 --with-risk
+# graph mode=dynamic-graph nodes=6 edges=7 loops_total=7
+#   combined=7.26%  risk=57.4/100  weakest=Kamino dq=partial
+#   combined=6.20%  risk=98.3/100  weakest=Marinade Finance dq=partial
+#   combined=6.18%  risk=85.3/100  weakest=Kamino dq=partial
+#   combined=5.61%  risk=92.2/100  weakest=Jito dq=partial
+#   combined=5.27%  risk=61.9/100  weakest=Kamino dq=partial
+# — Marinade scored 98.3/100, Jito 92.2 — based on real APY history
+#   from `defi rate-chart`, NOT made up.
+# — Kamino pools score 57-85 because their APY/TVL is more volatile.
+# — Discovery itself: no hardcoded receipt map — the SOL→mSOL,
+#   SOL→JitoSOL, etc. edges were derived live from `defi detail`'s
+#   first-class lpToken/underlyingToken fields.
 
-$ defi-strategist run-loop --loop-id 4b8b976e9880 --token SOL --chains solana \
+$ defi-strategist discover --token SOL --chains solana --max-products-per-chain 20 \
+    --max-steps 3 --composed-only --min-step-apy 0
+# also surfaces 3-step compositions when product cap is large enough,
+# e.g. SOL → Marinade → mSOL → Solayer → smSOL (the previously-hidden
+# Solayer-staked-mSOL receipt symbol the v0.2 hardcoded map didn't know)
+
+$ defi-strategist run-loop --loop-id <id> --token SOL --chains solana \
     --address $W --amount-minimal-units 1000000
-# dry-run-actions by default: builds calldata for both steps via OnChainOS,
-# completed=True, submitted_count=0, fills=[Marinade step, Solayer step]
+# dry-run by default: builds calldata for each step via OnChainOS,
+# completed=True, fills=[...per-step calldata...]
+# On step N failure: rollback_fills=[...best-effort defi-redeem
+# calldata for each completed leg in reverse order...]
 ```
 
 ---
@@ -135,10 +154,12 @@ subprocess-wrapper safety story.
 | `_extract_tx_hash` covers `txHash`, `transactionHash`, `orderId`, `hash` variants | `scripts/executor.py` |
 | Auth error mapped to `wallet_not_logged_in` (same vocabulary as read path) | `scripts/executor.py:_run` |
 | Refuses to submit if `to` is missing for EVM input_data, or if neither `input_data` nor `unsigned_tx` was extracted | `scripts/executor.py` |
-| Loop executor polls `defi positions` between steps to get the actual receipt-token balance, protects against step-1 partial-fill over-deposit in step 2 | `scripts/loop_executor.py:_wait_for_receipt` |
-| Self-loop filter — step 2 can't be the same investment_id as step 1 | `scripts/discoverer.py` |
+| Loop executor polls `defi positions` between steps to get the actual receipt-token balance, protects against partial-fill over-deposit in subsequent legs | `scripts/loop_executor.py:_wait_for_receipt` |
+| **Rollback on any-step failure** — walks completed legs in reverse, emits `defi redeem` calldata for each. Rollback failures don't abort the chain — we try to exit every position. | `scripts/loop_executor.py:_rollback` |
+| Self-loop / cycle filter — N-step traversal can't revisit the same token (avoid graph cycles that would mint duplicates) | `scripts/graph.py:find_loops` |
 | Combined APY is the naive sum and labeled as such — every multi-step loop carries a `notes` field stating it's an upper bound | `scripts/discoverer.py:_mk_loop` |
-| **42 tests** covering rules + adapter + executor + composability map + discoverer — all green | `tests/` |
+| Per-product risk score cache so the same product across multiple loops only gets chart-fetched once | `scripts/discoverer.py:attach_risk_scores` |
+| **85 tests** covering rules + adapter + executor + composability + discoverer + dynamic graph builder + N-step loop executor with rollback + risk scoring — all green | `tests/` |
 
 **Evidence:** the live scan returns 26 opportunities across 3 stablecoins
 on Solana+Ethereum in a single cycle, normalized into a stable shape and

@@ -35,7 +35,8 @@ from .onchain_defi import DefiAdapter, DefiError
 
 @dataclass
 class LoopFill:
-    """One full execution of a Loop. Aggregates per-step fills."""
+    """One full execution of a Loop. Aggregates per-step fills,
+    rollback fills (best-effort on failure), and any errors."""
     loop_id: str
     address: str
     chain: str
@@ -43,6 +44,7 @@ class LoopFill:
     submitted_count: int
     completed: bool
     fills: list[dict[str, Any]] = field(default_factory=list)
+    rollback_fills: list[dict[str, Any]] = field(default_factory=list)
     errors: list[dict[str, Any]] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
@@ -54,6 +56,7 @@ class LoopFill:
             "submitted_count": self.submitted_count,
             "completed": self.completed,
             "fills": self.fills,
+            "rollback_fills": self.rollback_fills,
             "errors": self.errors,
         }
 
@@ -75,6 +78,17 @@ class LoopExecutor:
         self.poll_timeout_sec = poll_timeout_sec
 
     def run(self, *, amount_minimal_units: str) -> LoopFill:
+        """Execute the loop step-by-step. On step N failure (N>=2),
+        walk back through completed steps 1..N-1 in reverse and emit
+        best-effort `redeem(ratio="1")` calldata to exit the
+        intermediate positions. Rollback fills are recorded separately
+        in `rollback_fills` so callers can distinguish forward
+        progress from cleanup.
+
+        Generalizes the v0.2 2-step path to N steps. Each subsequent
+        step's deposit amount comes from polling the on-chain receipt
+        balance (live mode) — protects against partial-fill over-
+        deposit when intermediate steps slip."""
         fill = LoopFill(
             loop_id=self.loop.loop_id,
             address=self.executor.address,
@@ -87,55 +101,95 @@ class LoopExecutor:
             fill.errors.append({"kind": "loop_empty", "detail": "no steps to execute"})
             return fill
 
-        # --- Step 1 ---
-        step1 = self.loop.steps[0]
-        try:
-            step1_fill = self._execute_step(step1, amount_minimal_units)
-        except DefiExecutorError as e:
-            fill.errors.append({"kind": "step1_failed", "detail": str(e)})
-            return fill
-        fill.fills.append(step1_fill)
-        if step1_fill.get("submitted"):
-            fill.submitted_count += 1
+        completed_steps: list[tuple[Step, dict[str, Any]]] = []
+        next_amount = amount_minimal_units
 
-        # If there's only one step (single-product yield), we're done.
-        if len(self.loop.steps) == 1:
-            fill.completed = True
-            return fill
+        for idx, step in enumerate(self.loop.steps):
+            if idx > 0:
+                # Determine this step's input amount from the previous
+                # step's receipt. In dry-run, reuse the base amount as
+                # a placeholder (calldata shape is what matters, not
+                # the dollar value). In live, poll for the receipt
+                # balance and use the actual on-chain amount.
+                if self.executor.dry_run:
+                    next_amount = amount_minimal_units
+                    note = f"dry-run: step{idx + 1} uses base amount as placeholder"
+                else:
+                    polled = self._wait_for_receipt(step.input_token)
+                    if polled is None:
+                        fill.errors.append({
+                            "kind": f"step{idx + 1}_skipped",
+                            "detail": (
+                                f"receipt balance for {step.input_token!r} did "
+                                f"not appear within {self.poll_timeout_sec:.0f}s; "
+                                f"step {idx + 1} not submitted"
+                            ),
+                        })
+                        self._rollback(completed_steps, fill)
+                        return fill
+                    next_amount = str(polled)
+                    note = f"live: step{idx + 1} amount derived from polled receipt balance"
+            else:
+                note = ""
 
-        # --- Step 2 ---
-        step2 = self.loop.steps[1]
-        # In dry-run, we never actually moved funds, so the receipt
-        # balance won't appear. Use the input amount as a placeholder
-        # so the dry-run calldata build still demonstrates the shape.
-        if self.executor.dry_run:
-            step2_amount = amount_minimal_units
-            note = "dry-run: using step1 input amount as placeholder for step2"
-        else:
-            polled = self._wait_for_receipt(step2.input_token)
-            if polled is None:
-                fill.errors.append({
-                    "kind": "step2_skipped",
-                    "detail": (
-                        f"receipt balance for {step2.input_token!r} did not "
-                        f"appear within {self.poll_timeout_sec:.0f}s; "
-                        "step 2 not submitted"
-                    ),
-                })
+            try:
+                step_fill = self._execute_step(step, next_amount, note=note)
+            except DefiExecutorError as e:
+                fill.errors.append({"kind": f"step{idx + 1}_failed", "detail": str(e)})
+                self._rollback(completed_steps, fill)
                 return fill
-            step2_amount = str(polled)
-            note = "live: amount derived from polled receipt balance"
 
-        try:
-            step2_fill = self._execute_step(step2, step2_amount, note=note)
-        except DefiExecutorError as e:
-            fill.errors.append({"kind": "step2_failed", "detail": str(e)})
-            return fill
-        fill.fills.append(step2_fill)
-        if step2_fill.get("submitted"):
-            fill.submitted_count += 1
+            fill.fills.append(step_fill)
+            if step_fill.get("submitted"):
+                fill.submitted_count += 1
+            completed_steps.append((step, step_fill))
+
         fill.completed = True
         return fill
+
+    def _rollback(
+        self,
+        completed_steps: list[tuple[Step, dict[str, Any]]],
+        fill: LoopFill,
+    ) -> None:
+        """Walk back through completed steps in reverse, emit best-
+        effort redeem calldata for each. Failures during rollback are
+        logged but do not abort the rollback — we try to exit every
+        position even if one redeem fails.
+
+        Best-effort by design — true atomic rollback would require
+        either smart-contract-level batching with revert semantics, or
+        a compensation pattern that's out of scope for v0.3. The
+        residual risk (some intermediate position not cleanly exited)
+        is documented in `rollback_fills` + `errors` so the operator
+        can manually finish the cleanup."""
+        if not completed_steps:
+            return
+        if self.executor.dry_run:
+            # Even in dry-run, demonstrate the rollback shape — build
+            # redeem calldata for inspection.
+            pass
+        for idx, (step, step_fill) in enumerate(reversed(completed_steps)):
+            inv_id = step.investment_id
+            if not inv_id:
+                fill.errors.append({
+                    "kind": "rollback_skipped",
+                    "step_index": len(completed_steps) - 1 - idx,
+                    "detail": "no investment_id on step; cannot build redeem",
+                })
+                continue
+            try:
+                rb = self.executor.redeem(investment_id=inv_id, ratio="1")
+                rb["rolled_back_step_index"] = len(completed_steps) - 1 - idx
+                rb["rolled_back_step_meta"] = step.as_dict()
+                fill.rollback_fills.append(rb)
+            except DefiExecutorError as e:
+                fill.errors.append({
+                    "kind": "rollback_failed",
+                    "step_index": len(completed_steps) - 1 - idx,
+                    "investment_id": inv_id,
+                    "detail": str(e),
+                })
 
     # ---- helpers ----
 

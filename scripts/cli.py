@@ -20,7 +20,7 @@ import yaml
 
 from . import audit as audit_mod
 from . import watch
-from .discoverer import discover_loops
+from .discoverer import attach_risk_scores, discover_loops, discover_loops_v3
 from .executor import DefiExecutor
 from .loop_executor import LoopExecutor
 from .onchain_defi import DefiAdapter, DefiError, normalize_product
@@ -180,19 +180,44 @@ def cmd_discover(args: argparse.Namespace) -> int:
     if not chains:
         return _failed("discover_requires_chains")
     adapter = DefiAdapter(cache_ttl_sec=0)
-    loops = discover_loops(
-        base_asset=args.token,
-        chains=chains,
-        adapter=adapter,
-        min_tvl_usd=args.min_tvl,
-        min_step_apy_pct=args.min_step_apy,
-        include_single_step=not args.composed_only,
-        include_2step=not args.single_step_only,
-    )
+    if args.legacy_receipt_map:
+        loops = discover_loops(
+            base_asset=args.token,
+            chains=chains,
+            adapter=adapter,
+            min_tvl_usd=args.min_tvl,
+            min_step_apy_pct=args.min_step_apy,
+            include_single_step=not args.composed_only,
+            include_2step=not args.single_step_only,
+        )
+        graph_stats = {"mode": "legacy-receipt-map"}
+    else:
+        loops, graph = discover_loops_v3(
+            base_asset=args.token,
+            chains=chains,
+            adapter=adapter,
+            max_steps=args.max_steps,
+            min_tvl_usd=args.min_tvl,
+            min_step_apy_pct=args.min_step_apy,
+            include_single_step=not args.composed_only,
+            max_products_per_chain=args.max_products_per_chain,
+        )
+        graph_stats = {"mode": "dynamic-graph", **graph.stats()}
     sliced = loops[: args.top] if args.top is not None else loops
+    # Risk scoring is opt-in because it adds 2 chart fetches per
+    # step (1 rate, 1 tvl) and can be slow for large discover runs.
+    if args.with_risk:
+        attach_risk_scores(sliced, adapter)
+        if args.min_risk_score is not None:
+            sliced = [
+                lp for lp in sliced
+                if (lp.risk or {}).get("loop_score") is None
+                or (lp.risk or {}).get("loop_score", 0) >= args.min_risk_score
+            ]
     return _ok({
         "count_total": len(loops),
         "count_returned": len(sliced),
+        "graph": graph_stats,
         "loops": [lp.as_dict() for lp in sliced],
     })
 
@@ -251,7 +276,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Monitor positions, scan opportunities, fire alerts on rules."
         ),
     )
-    p.add_argument("--version", action="version", version="defi-strategist 0.2.0")
+    p.add_argument("--version", action="version", version="defi-strategist 0.3.0")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     wa = sub.add_parser("watch", help="Run the monitor loop")
@@ -321,6 +346,34 @@ def build_parser() -> argparse.ArgumentParser:
     di.add_argument("--min-step-apy", type=float, default=0.5, dest="min_step_apy", help="Per-step minimum APY %% (default 0.5)")
     di.add_argument("--composed-only", action="store_true", help="Show only 2+ step compositions")
     di.add_argument("--single-step-only", action="store_true", help="Show only single-step opportunities")
+    di.add_argument(
+        "--max-steps", type=int, default=3, dest="max_steps",
+        help="Max steps per loop (graph mode only; default 3)",
+    )
+    di.add_argument(
+        "--max-products-per-chain", type=int, default=200, dest="max_products_per_chain",
+        help="Cap on products explored per chain during graph build (default 200)",
+    )
+    di.add_argument(
+        "--legacy-receipt-map", action="store_true", dest="legacy_receipt_map",
+        help=(
+            "Use v0.2's hardcoded RECEIPT_MAP instead of v0.3's dynamic graph "
+            "(diagnostic; falls back to 2-step LST→restake compositions only)"
+        ),
+    )
+    di.add_argument(
+        "--with-risk", action="store_true", dest="with_risk",
+        help=(
+            "Compute per-step risk scores (APY volatility + TVL stability) "
+            "via `defi rate-chart` + `tvl-chart`. Adds 2 chart fetches per "
+            "step per loop; slower but every loop gets a 0-100 risk score "
+            "and its weakest-link breakdown."
+        ),
+    )
+    di.add_argument(
+        "--min-risk-score", type=float, default=None, dest="min_risk_score",
+        help="With --with-risk, filter out loops scoring below this (0-100). Unscored loops are kept by default.",
+    )
     di.set_defaults(_handler=cmd_discover)
 
     rl = sub.add_parser(

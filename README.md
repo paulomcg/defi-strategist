@@ -14,9 +14,9 @@ better yield, when to halt because concentration ran away.
 `defi-strategist` is the v0.1 monitor + rules layer that closes that
 gap.
 
-> Status: v0.2.0 — monitor + auto-compound + composable loop
-> discovery and on-demand execution. Submitted to the OKX Agentic
-> Trading Contest (May 2026). Companion to
+> Status: v0.3.0 — dynamic graph discovery + risk scoring + N-step
+> execution + rollback. Submitted to the OKX Agentic Trading Contest
+> (May 2026). Companion to
 > [portfolio-manager](https://github.com/paulomcg/portfolio-manager) +
 > [strategy-backtester](https://github.com/paulomcg/strategy-backtester).
 > MIT licensed. Not investment advice.
@@ -51,18 +51,43 @@ pattern that `portfolio-manager` (PM) pioneered for spot trading:
           └───────────────────────────────────────────────────┘
 ```
 
-### What v0.2 does
+### What v0.3 does
 
-**NEW in v0.2 — composable loop discovery + on-demand execution.**
+**NEW in v0.3 — four pillars of "real product" composable yield.**
+
+1. **Dynamic graph discovery.** `discover` no longer relies on a
+   hardcoded receipt-token map. It walks OnChainOS `defi detail`'s
+   first-class `lpToken` + `underlyingToken` fields to build a token-
+   edge graph dynamically, then enumerates loops up to `--max-steps N`
+   (default 3) starting from any base asset. New protocols surface
+   automatically — no code changes needed.
+2. **Risk scoring.** With `--with-risk`, each step gets a 0-100
+   composite score from APY volatility (stdev over historical
+   `rate-chart`) + TVL stability (1 - stdev/mean over `tvl-chart`).
+   Loop score = `min(per-step scores)` — weakest-link aggregation.
+   `--min-risk-score 60` filters out shaky compositions.
+3. **N-step execution with receipt-balance polling.** `run-loop`
+   handles arbitrary-length loops; each subsequent step's amount is
+   derived from polling the on-chain receipt-token balance after the
+   previous step settles (live mode). Protects against partial-fill
+   over-deposit in the next leg.
+4. **Rollback on partial failure.** If step N fails after steps
+   1..N-1 succeeded, the executor walks back through completed legs
+   in reverse and emits best-effort `defi redeem` calldata for each
+   to exit the intermediate positions. Rollback fills are recorded
+   separately in `rollback_fills` so the operator can distinguish
+   forward progress from cleanup.
+
+**Carry-over from v0.2 — composable loop discovery + on-demand execution.**
 `defi-strategist discover --token SOL --chains solana` enumerates not
-just single-product opportunities, but **2-step compositions where
-step 1's receipt token is itself accepted by another product**. On
+just single-product opportunities, but **N-step compositions where
+each step's receipt token is accepted by the next product**. On
 Solana this surfaces SOL → Jito (mints JitoSOL) → Solayer (restakes
-JitoSOL) and the equivalent Marinade path. On Ethereum it surfaces
-ETH → Lido (mints stETH/wstETH) → Aave V3 / Morpho (uses wstETH as
-collateral). Loops are sorted by combined APY, each gets a stable
-`loop_id`, and `run-loop --loop-id <id> --amount-minimal-units N`
-executes the full sequence step-by-step.
+JitoSOL → sjitoSOL). On Ethereum it surfaces ETH → Lido (mints
+stETH/wstETH) → Aave V3 / Morpho (uses wstETH as collateral). Loops
+are sorted by combined APY, each gets a stable `loop_id`, and
+`run-loop --loop-id <id> --amount-minimal-units N` executes the full
+sequence step-by-step.
 
 Five things v0.2 does:
 
