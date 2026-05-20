@@ -14,43 +14,51 @@ partial failure. `defi-strategist` is that driver.
 
 ## What you can ask the agent to do
 
-Natural-language prompts and what the agent does with them:
+Natural-language prompts the user says, and what the agent does
+with them.
 
-### "Where should I park my idle USDC right now?"
+---
 
-Agent scans every USDC-accepting product across Solana, Ethereum,
-and Base via OnChainOS, ranks by APY, dedups across protocols, and
-shows the user the top opportunities side-by-side. Kamino Main Pool
-at 7.41%, Syrup at 4.88%, Aave V3 at 3.83% — the agent surfaces all
-of them and lets the user pick.
+> **"Where should I park my idle USDC right now?"**
 
-### "Find me a composable yield loop on SOL and tell me which is safest"
+The agent scans every USDC-accepting product across Solana,
+Ethereum, and Base via OnChainOS, ranks by APY, dedups across
+protocols, and shows the user the top opportunities side-by-side.
+Kamino Main Pool at 7.41%, Syrup at 4.88%, Aave V3 at 3.83% — the
+agent surfaces all of them and lets the user pick.
 
-Agent dynamically builds a token-edge graph from OnChainOS DeFi
-data, walks it up to 3 steps deep, surfaces every loop starting
-from SOL — both single-product yields AND multi-step compositions
-(Marinade → Solayer restake, Jito → Solayer, etc.). With risk
-scoring on, each loop gets a 0-100 score derived from real APY
-volatility + TVL stability history.
+---
 
-Marinade at 6.20% scores **98.3/100** (rock-steady APY history).
-Kamino's top APY at 9.36% scores **29.2/100** (volatile). The agent
-shows the trade-off and lets the user choose between APY and
-trustworthiness, not just chase the biggest number.
+> **"Find me a composable yield loop on SOL and tell me which is safest."**
 
-### "Run that Marinade → Solayer loop with 0.1 SOL"
+The agent dynamically builds a token-edge graph from OnChainOS
+DeFi data, walks it up to 3 steps deep, surfaces every loop
+starting from SOL — both single-product yields AND multi-step
+compositions (Marinade → Solayer restake, Jito → Solayer, etc.).
+With risk scoring on, each loop gets a 0-100 score derived from
+real APY-volatility + TVL-stability history.
 
-Agent dry-runs first by default — builds the calldata for both
+> Marinade at 6.20% scores **98.3/100** (rock-steady APY).
+> Kamino's top APY at 9.36% scores **29.2/100** (volatile).
+> The agent shows the trade-off so the user chooses between APY
+> and trustworthiness, not just chases the biggest number.
+
+---
+
+> **"Run that Marinade → Solayer loop with 0.1 SOL."**
+
+The agent dry-runs first by default — builds the calldata for both
 legs via OnChainOS, shows the user what's about to be broadcast,
-no funds move. Once the user confirms, the agent re-runs with
-`--live`. The executor broadcasts step 1, polls the on-chain
-mSOL balance until it confirms, then uses the ACTUAL received
-amount (not the user's estimate) for step 2's Solayer deposit.
-If step 2 fails, the executor walks back through completed legs
-and emits best-effort redeem calldata to exit the intermediate
-position.
+no funds move. Once the user confirms, the agent re-runs in live
+mode. The executor broadcasts step 1, polls the on-chain mSOL
+balance until it confirms, then uses the ACTUAL received amount
+(not the user's estimate) for step 2's Solayer deposit. If step 2
+fails, the executor walks back through completed legs and emits
+best-effort redeem calldata to exit the intermediate position.
 
-### "Auto-compound my rewards weekly when they exceed $10"
+---
+
+> **"Auto-compound my rewards weekly when they exceed $10."**
 
 User-authored rule:
 
@@ -62,14 +70,16 @@ rules:
     reinvest: true
 ```
 
-Agent points `defi-strategist watch` at the wallet + rule. Every
-cycle the rule fires if pending rewards > $10, the executor builds
-a `claim` calldata (and a `reinvest` follow-up if rewards came back
-as the underlying token), and `wallet contract-call` signs +
-broadcasts via the Agentic Wallet's TEE-backed signer. The simplest
-non-trivial DeFi loop, fully unattended.
+The agent points `defi-strategist watch` at the wallet + rule.
+Every cycle the rule fires if pending rewards > $10, the executor
+builds the `claim` calldata (and a `reinvest` follow-up if rewards
+came back as the underlying token), and `wallet contract-call`
+signs + broadcasts via the Agentic Wallet's TEE-backed signer. The
+simplest non-trivial DeFi loop, fully unattended.
 
-### "Watch my DeFi positions and alert me if any yield drops below 3%"
+---
+
+> **"Watch my DeFi positions and alert me if any yield drops below 3%."**
 
 ```yaml
 rules:
@@ -83,35 +93,45 @@ rules:
     severity: warn
 ```
 
-Agent starts a continuous monitor — no on-chain actions, just polls
-positions + opportunities and fires alerts to the audit log when any
-rule trips. The agent can come back later and ask "any new alerts?"
-or "what changed overnight?" by tailing the audit.
+The agent starts a continuous monitor — no on-chain actions, just
+polls positions + opportunities and fires structured alerts to the
+audit log when any rule trips. The agent can come back later and
+ask *"any new alerts?"* or *"what changed overnight?"* by tailing
+the audit.
 
-### "Is there a better yield for my existing position anywhere?"
+---
 
-Rule type `opportunity_above` watches a list of tokens, surfaces
-products on those tokens above an APY threshold that the user
-doesn't already hold. Agent gets a structured alert: "Morpho
-Steakhouse Prime USD at 8.2% beats your current Kamino USDC at
-6.45% — want me to rotate?"
+> **"Is there a better yield for my existing position anywhere?"**
 
-### "Stop everything immediately — I need to think"
+The `opportunity_above` rule watches a list of tokens and surfaces
+products above an APY threshold that the user doesn't already hold.
+The agent gets a structured alert:
 
-Agent kills the watch process. Without `--live` no on-chain action
-fires anyway; with `--live`, the loop stops at the next interval
-boundary. There is no persisted "live mode on" state.
+> *"Morpho Steakhouse Prime USD at 8.2% beats your current Kamino
+> USDC at 6.45% — want me to rotate?"*
+
+---
+
+> **"Stop everything immediately — I need to think."**
+
+The agent kills the watch process. Without `--live` no on-chain
+action fires anyway; with `--live`, the loop stops at the next
+interval boundary. There is no persisted "live mode on" state.
+
+---
 
 ### Three-stage opt-in safety
 
 | Stage | Flag | Behavior |
 |---|---|---|
-| Monitor (default) | (no flag) | Rules emit, actions recorded only, no OnChainOS write calls |
-| Dry-run | `--dry-run-actions` | Action calldata built via OnChainOS, NOT broadcast |
-| Live | `--live` | Calldata built AND broadcast via `wallet contract-call` |
+| **Monitor** (default) | (no flag) | Rules emit, actions recorded only, no OnChainOS write calls |
+| **Dry-run** | `--dry-run-actions` | Action calldata built via OnChainOS, **NOT** broadcast |
+| **Live** | `--live` | Calldata built AND broadcast via `wallet contract-call` |
 
 `--max-actions-per-cycle N` caps actions per cycle (default 5) so a
 misfiring rule can't burn budget through hundreds of round-trips.
+
+---
 
 ### Integration paths (Claude Code, Codex, custom agents)
 
