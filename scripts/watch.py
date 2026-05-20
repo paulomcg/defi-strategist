@@ -23,9 +23,14 @@ from typing import Any, TextIO
 from uuid import uuid4
 
 from . import audit, rules as rules_engine
+from .executor import DefiExecutor, DefiExecutorError
 from .onchain_defi import DefiAdapter, DefiError, normalize_product
 
 _DEFAULT_INTERVAL = 60
+
+
+class MonitorHalt(Exception):
+    """Raised to terminate the loop cleanly mid-cycle (kill-switch trip)."""
 
 
 def _now() -> str:
@@ -44,17 +49,36 @@ def run_monitor(
     sink: TextIO | None = None,
     sleep_fn=time.sleep,
     adapter: DefiAdapter | None = None,
+    executor: DefiExecutor | None = None,
+    max_actions_per_cycle: int = 5,
 ) -> dict[str, Any]:
     """Run the monitor loop. Returns a summary dict on exit.
 
     `address` may be None — in that case only opportunity scanning runs
     (no position fetch). Useful for "scan-only" mode where the user
     wants to surface yield opportunities without exposing a wallet.
+
+    `executor` controls action handling:
+      - None (default): actions emitted by rules are recorded only, never
+        sent to OnChainOS. Pure monitor mode.
+      - DefiExecutor instance (dry_run=True): calldata is BUILT for each
+        action (a real OnChainOS round-trip), recorded for inspection,
+        but never broadcast. Useful for verifying that a rule emits
+        actions OnChainOS understands.
+      - DefiExecutor instance (dry_run=False): calldata is built AND
+        submitted via `wallet contract-call`. Real on-chain transactions
+        fire. Requires `--live` on the CLI side.
+
+    `max_actions_per_cycle` caps how many actions may execute per cycle
+    (safety against a rule misfire emitting hundreds of actions).
     """
     sink = sink or sys.stdout
     adapter = adapter or DefiAdapter()
     cycles = 0
     alerts_total = 0
+    actions_total = 0
+    submitted_total = 0
+    halt_reason: str | None = None
     interrupted = False
 
     def _on_sigint(signum, frame):  # noqa: ARG001
@@ -71,6 +95,16 @@ def run_monitor(
         "rules_count": len(rules_config),
         "interval_seconds": interval_seconds,
         "iterations_cap": iterations,
+        "executor": (
+            {
+                "address": executor.address,
+                "chain": executor.chain,
+                "dry_run": executor.dry_run,
+            }
+            if executor is not None
+            else None
+        ),
+        "max_actions_per_cycle": max_actions_per_cycle,
     })
     try:
         while True:
@@ -89,13 +123,45 @@ def run_monitor(
             )
             cycle["positions"] = positions
             cycle["opportunities_count"] = len(opportunities)
-            alerts = rules_engine.evaluate(
+            alerts, actions = rules_engine.evaluate(
                 positions=positions,
                 opportunities=opportunities,
                 rules=rules_config,
             )
             cycle["alerts"] = [a.as_dict() for a in alerts]
+            cycle["actions"] = [a.as_dict() for a in actions]
             alerts_total += len(alerts)
+            actions_total += len(actions)
+
+            # Execute actions if an executor was provided. Capped by
+            # max_actions_per_cycle and short-circuited on any error
+            # so a single failure doesn't cascade into the rest of the
+            # batch.
+            cycle["fills"] = []
+            if executor is not None and actions:
+                for i, act in enumerate(actions):
+                    if i >= max_actions_per_cycle:
+                        cycle["errors"].append({
+                            "kind": "max_actions_per_cycle",
+                            "detail": (
+                                f"capped at {max_actions_per_cycle}; "
+                                f"{len(actions) - i} actions skipped"
+                            ),
+                        })
+                        break
+                    try:
+                        fill = _execute_action(executor, act)
+                    except DefiExecutorError as e:
+                        cycle["errors"].append({
+                            "kind": "executor_error",
+                            "verb": act.verb,
+                            "rule_id": act.rule_id,
+                            "detail": str(e),
+                        })
+                        break
+                    cycle["fills"].append(fill)
+                    if fill.get("submitted"):
+                        submitted_total += 1
 
             sink.write(json.dumps(cycle, default=str) + "\n")
             sink.flush()
@@ -114,10 +180,36 @@ def run_monitor(
         "ok": True,
         "iterations": cycles,
         "alerts_total": alerts_total,
+        "actions_total": actions_total,
+        "submitted_total": submitted_total,
+        "halted": halt_reason is not None,
+        "halt_reason": halt_reason,
         "interrupted": interrupted,
     }
     audit.append({"event": "monitor.end", **summary})
     return summary
+
+
+def _execute_action(executor: DefiExecutor, action) -> dict[str, Any]:
+    """Dispatch an Action to the right executor verb."""
+    if action.verb == "claim":
+        return executor.claim(
+            investment_id=action.investment_id,
+            platform_id=action.platform_id,
+            reward_type=action.reward_type,
+            expect_output=action.expect_output,
+        )
+    if action.verb == "reinvest":
+        if not (action.investment_id and action.token and action.amount_minimal_units):
+            raise DefiExecutorError(
+                f"reinvest_missing_fields rule_id={action.rule_id}"
+            )
+        return executor.reinvest(
+            investment_id=action.investment_id,
+            token=action.token,
+            amount_minimal_units=action.amount_minimal_units,
+        )
+    raise DefiExecutorError(f"unknown_action_verb {action.verb!r}")
 
 
 # ---- helpers ----

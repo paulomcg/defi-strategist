@@ -1,9 +1,11 @@
 name: defi-strategist
-version: 0.1.0
+version: 0.1.5
 description: >
   Strategy + observability layer over OnChainOS DeFi primitives. Monitors
   user DeFi positions, scans yield opportunities, fires structured alerts
-  on user-defined rules. v0.1 is read-only — no on-chain actions.
+  on user-defined rules. v0.1.5 adds auto-compound write actions
+  (claim + reinvest) via `defi claim` + `wallet contract-call`, with
+  --live / --dry-run-actions safety gates.
 author: paulomcg
 license: MIT
 entrypoint: ./bin/defi-strategist

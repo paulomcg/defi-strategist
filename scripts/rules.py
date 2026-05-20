@@ -1,8 +1,8 @@
-"""Alert rules engine.
+"""Alert + action rules engine.
 
-Pure function: `(positions, opportunities, rules_config) -> list[Alert]`.
+Pure function: `(positions, opportunities, rules_config) -> (alerts, actions)`.
 
-Three built-in rule types covering the most common DeFi monitoring needs:
+### Alert rule types (v0.1 — read-only)
 
   - `min_apy_floor` — alert when a held position's current APY drops below
     a threshold. Catches yields that decay below opportunity cost.
@@ -12,18 +12,30 @@ Three built-in rule types covering the most common DeFi monitoring needs:
   - `opportunity_above` — alert when an opportunity (from search/list) on
     a watched token exceeds X% APY. Surfaces yield rotation candidates.
 
-Each alert carries a `severity` (info | warn | crit), a structured `kind`
+### Action rule types (v0.1.5 — write-capable when --live)
+
+  - `auto_compound` — when a held position has pending rewards worth
+    more than `min_rewards_usd`, emit a `claim` action; if the rule has
+    `reinvest: true`, ALSO emit a `reinvest` action that deposits the
+    claimed rewards back into the same product. Closes the simplest
+    non-trivial DeFi loop.
+
+Each Action carries an `action` verb, the OnChainOS-relevant ids
+(`investment_id`, `platform_id`, etc.), and a structured `meta` block.
+The executor consumes these directly.
+
+Each Alert carries a `severity` (info | warn | crit), a structured `kind`
 (machine-readable), and a one-line `message` (human-readable).
 
 Strategy-completeness note: this is intentionally a small set. Users
 who need more can author a Python `monitor.py` with a `monitor(state) ->
-list[Alert]` function and load it via `--monitor` (the same hook pattern
-PM uses for strategies).
+(list[Alert], list[Action])` function and load it via `--monitor` (the
+same hook pattern PM uses for strategies).
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from typing import Any
 
 
@@ -38,30 +50,61 @@ class Alert:
         return asdict(self)
 
 
+@dataclass
+class Action:
+    """A v0.1.5 write action. Consumed by `executor.DefiExecutor`.
+
+    `verb` is `claim` or `reinvest`. The remaining fields carry the
+    OnChainOS identifiers the executor needs to build the calldata.
+    """
+    verb: str                                    # claim | reinvest
+    rule_id: str
+    investment_id: str | None = None
+    platform_id: str | None = None
+    reward_type: str = "REWARD_PLATFORM"
+    token: str | None = None
+    amount_minimal_units: str | None = None
+    expect_output: list[dict[str, Any]] | None = None
+    meta: dict[str, Any] = field(default_factory=dict)
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 def evaluate(
     *,
     positions: list[dict[str, Any]],
     opportunities: list[dict[str, Any]],
     rules: list[dict[str, Any]],
-) -> list[Alert]:
-    out: list[Alert] = []
+) -> tuple[list[Alert], list[Action]]:
+    """Evaluate rules against the current state.
+
+    Returns ``(alerts, actions)``. v0.1 callers that only care about
+    alerts can take the first element.
+    """
+    alerts: list[Alert] = []
+    actions: list[Action] = []
     total_value = sum(_f(p.get("value_usd")) for p in positions) or 1.0
     for r in rules:
         kind = r.get("type")
         if kind == "min_apy_floor":
-            out.extend(_min_apy_floor(positions, r))
+            alerts.extend(_min_apy_floor(positions, r))
         elif kind == "max_protocol_concentration":
-            out.extend(_max_concentration(positions, total_value, r))
+            alerts.extend(_max_concentration(positions, total_value, r))
         elif kind == "opportunity_above":
-            out.extend(_opportunity_above(positions, opportunities, r))
+            alerts.extend(_opportunity_above(positions, opportunities, r))
+        elif kind == "auto_compound":
+            new_alerts, new_actions = _auto_compound(positions, r)
+            alerts.extend(new_alerts)
+            actions.extend(new_actions)
         else:
-            out.append(Alert(
+            alerts.append(Alert(
                 severity="warn",
                 kind="unknown_rule_type",
                 message=f"unknown rule type: {kind!r}",
                 context={"rule": r},
             ))
-    return out
+    return alerts, actions
 
 
 # ---- rule implementations ----
@@ -147,6 +190,73 @@ def _opportunity_above(
             context={"opportunity": opp, "rule_id": rule.get("id"), "threshold": threshold},
         ))
     return out
+
+
+def _auto_compound(
+    positions: list[dict[str, Any]],
+    rule: dict[str, Any],
+) -> tuple[list[Alert], list[Action]]:
+    """Emit `claim` (and optionally `reinvest`) actions for positions with
+    pending rewards above the threshold.
+
+    Pending rewards are read from `position["pending_rewards_usd"]`,
+    which the watch loop populates by inspecting `defi position-detail`.
+    Positions without that field — or with reward value below the
+    threshold — are silently skipped (no alert, no action).
+    """
+    min_usd = _f(rule.get("min_rewards_usd"))
+    do_reinvest = bool(rule.get("reinvest"))
+    rule_id = rule.get("id") or "auto_compound"
+    alerts: list[Alert] = []
+    actions: list[Action] = []
+    for p in positions:
+        rewards = _f(p.get("pending_rewards_usd"))
+        if rewards < min_usd:
+            continue
+        inv_id = p.get("investment_id")
+        plat_id = p.get("platform_id")
+        # claim action
+        actions.append(Action(
+            verb="claim",
+            rule_id=rule_id,
+            investment_id=inv_id,
+            platform_id=plat_id,
+            reward_type=p.get("reward_type") or "REWARD_PLATFORM",
+            expect_output=p.get("reward_expect_output"),
+            meta={
+                "position": {
+                    "platform": p.get("platform"),
+                    "name": p.get("name"),
+                    "pending_rewards_usd": rewards,
+                },
+            },
+        ))
+        if do_reinvest and inv_id and p.get("reinvest_token") and p.get("reinvest_amount_minimal_units"):
+            actions.append(Action(
+                verb="reinvest",
+                rule_id=rule_id,
+                investment_id=inv_id,
+                token=p.get("reinvest_token"),
+                amount_minimal_units=str(p.get("reinvest_amount_minimal_units")),
+                meta={
+                    "follows": "claim",
+                    "position": {
+                        "platform": p.get("platform"),
+                        "name": p.get("name"),
+                    },
+                },
+            ))
+        alerts.append(Alert(
+            severity="info",
+            kind="auto_compound_triggered",
+            message=(
+                f"auto-compound: {p.get('platform','?')} / {p.get('name','?')} "
+                f"rewards=${rewards:.2f} (threshold ${min_usd:.2f}); "
+                f"will{' claim+reinvest' if do_reinvest else ' claim only'}"
+            ),
+            context={"rule_id": rule_id, "position": p},
+        ))
+    return alerts, actions
 
 
 def _f(v: Any) -> float:

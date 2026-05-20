@@ -20,6 +20,7 @@ import yaml
 
 from . import audit as audit_mod
 from . import watch
+from .executor import DefiExecutor
 from .onchain_defi import DefiAdapter, DefiError, normalize_product
 
 EXIT_OK = 0
@@ -78,6 +79,23 @@ def cmd_watch(args: argparse.Namespace) -> int:
     chains = _split_csv(args.chains) or _split_csv(cfg.get("chains"))
     tokens = _split_csv(args.tokens) or _split_csv(cfg.get("watch_tokens"))
     platforms = _split_csv(args.platforms) or _split_csv(cfg.get("watch_platforms"))
+
+    # Build the executor only when action execution is enabled
+    # (--live OR --dry-run-actions). Pure monitor mode (default) leaves
+    # the executor at None and no actions are dispatched even if rules
+    # emit them.
+    executor: DefiExecutor | None = None
+    if args.live or args.dry_run_actions:
+        if not args.address:
+            return _failed("live_requires_address — set --address to enable action execution")
+        if not chains:
+            return _failed("live_requires_chains — set --chains or put `chains:` in the rules YAML")
+        executor = DefiExecutor(
+            address=args.address,
+            chain=chains[0],
+            dry_run=not args.live,  # --live overrides --dry-run-actions
+        )
+
     summary = watch.run_monitor(
         address=args.address,
         chains=chains,
@@ -86,6 +104,8 @@ def cmd_watch(args: argparse.Namespace) -> int:
         rules_config=cfg.get("rules") or [],
         interval_seconds=args.interval,
         iterations=args.iterations,
+        executor=executor,
+        max_actions_per_cycle=args.max_actions_per_cycle,
     )
     return _ok(summary)
 
@@ -159,7 +179,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Monitor positions, scan opportunities, fire alerts on rules."
         ),
     )
-    p.add_argument("--version", action="version", version="defi-strategist 0.1.0")
+    p.add_argument("--version", action="version", version="defi-strategist 0.1.5")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     wa = sub.add_parser("watch", help="Run the monitor loop")
@@ -170,6 +190,35 @@ def build_parser() -> argparse.ArgumentParser:
     wa.add_argument("--platforms", default=None, help="Comma-separated platforms to scan (overrides config)")
     wa.add_argument("--interval", type=int, default=60, help="Seconds between cycles (default 60)")
     wa.add_argument("--iterations", type=int, default=None, help="Cap cycles (omit for infinite)")
+    wa.add_argument(
+        "--live",
+        action="store_true",
+        help=(
+            "Execute rule-emitted actions on-chain via OnChainOS "
+            "(`defi claim/invest` + `wallet contract-call`). Requires "
+            "--address. WITHOUT this flag, actions are inert."
+        ),
+    )
+    wa.add_argument(
+        "--dry-run-actions",
+        action="store_true",
+        help=(
+            "Build calldata for rule-emitted actions (real OnChainOS "
+            "round-trip) but DO NOT submit. Useful for verifying that a "
+            "rule emits well-formed actions before going --live."
+        ),
+    )
+    wa.add_argument(
+        "--max-actions-per-cycle",
+        type=int,
+        default=5,
+        dest="max_actions_per_cycle",
+        help=(
+            "Cap actions executed per cycle (safety; default 5). A rule "
+            "that misfires and emits 100 actions still spends at most "
+            "N round-trips per cycle."
+        ),
+    )
     wa.set_defaults(_handler=cmd_watch)
 
     po = sub.add_parser("positions", help="One-shot snapshot of user DeFi positions")

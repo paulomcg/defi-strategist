@@ -1,0 +1,41 @@
+# Auto-compound rule — claim pending rewards whenever they exceed $X
+# and optionally redeposit them into the same product.
+#
+# This is the canonical "DeFi loop" defi-strategist v0.1.5 was built to
+# close: instead of letting rewards sit idle (giving back any compound
+# interest you'd otherwise earn), the rule fires a `claim` action — and
+# if `reinvest: true`, also fires a `reinvest` action that pushes the
+# claimed amount straight back into the position.
+#
+# CRITICAL: actions only execute when you pass --live. By default, even
+# with this rule active, the strategist runs in pure monitor mode —
+# rule fires but the action is recorded only, never sent to OnChainOS.
+#
+# Use --dry-run-actions to round-trip with OnChainOS (build calldata for
+# inspection) without broadcasting. That's the recommended smoke test
+# before going --live for the first time on a new position.
+#
+# Usage:
+#   defi-strategist watch \
+#     --config examples/rules/auto-compound.yaml \
+#     --address <your-wallet> \
+#     --interval 3600 \
+#     --dry-run-actions    # verify before --live
+#
+# Then, after verifying the calldata looks right:
+#   defi-strategist watch \
+#     --config examples/rules/auto-compound.yaml \
+#     --address <your-wallet> \
+#     --interval 3600 \
+#     --live --max-actions-per-cycle 5
+
+name: auto-compound
+chains:
+  - solana
+
+rules:
+  - id: compound-pending-rewards
+    type: auto_compound
+    min_rewards_usd: 5.0     # don't bother claiming if rewards < $5 (gas)
+    reinvest: true           # claim + redeposit; set to false for claim-only
+    severity: info

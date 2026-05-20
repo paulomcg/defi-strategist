@@ -4,7 +4,7 @@
 **Submitted by:** Paulo Goncalves
 **OnChainOS as primary data + trading source:** ✅ (every API call is a
 subprocess of `onchainos defi *`)
-**Status:** v0.1.0, monitor-only — companion to
+**Status:** v0.1.5 — monitor + auto-compound write actions. Companion to
 [`portfolio-manager`](https://github.com/paulomcg/portfolio-manager)
 + [`strategy-backtester`](https://github.com/paulomcg/strategy-backtester)
 
@@ -18,19 +18,21 @@ concentration ran away. `defi-strategist` is the v0.1 of that layer.
 
 ## 1. Strategy completeness
 
-For v0.1 (monitor-only), the strategy surface is a **declarative rules
-engine** with three built-in rule types covering the most common DeFi
-monitoring needs. A v0.2 Python `monitor(state) → list[Action]` callback
-is in the roadmap (same pattern PM uses today for live strategies).
+The strategy surface is a **declarative rules engine** with four built-
+in rule types covering the most common DeFi monitoring + automation
+needs. The pure-function `evaluate()` returns `(alerts, actions)` —
+v0.1 callers can use just the alerts, v0.1.5 callers consume the
+actions to drive write operations.
 
 | What | Where |
 |---|---|
-| Pure-function rules engine: `(positions, opportunities, rules) → alerts` | `scripts/rules.py` |
+| Pure-function rules engine: `(positions, opportunities, rules) → (alerts, actions)` | `scripts/rules.py:evaluate` |
 | `min_apy_floor` rule — alert when held APY drops below threshold | `scripts/rules.py:_min_apy_floor` |
 | `max_protocol_concentration` rule — alert when one platform exceeds X% of DeFi value | `scripts/rules.py:_max_concentration` |
 | `opportunity_above` rule — surface yield-rotation candidates not already held | `scripts/rules.py:_opportunity_above` |
-| Two example rule configs covering scan-only and portfolio-health patterns | `examples/rules/` |
-| Three CLI verbs: `watch`, `positions`, `scan` | `scripts/cli.py` |
+| `auto_compound` rule — emit `claim` (and optional `reinvest`) actions when pending rewards exceed threshold | `scripts/rules.py:_auto_compound` |
+| Three example rule configs: scan-only, portfolio-health, auto-compound | `examples/rules/` |
+| Four CLI verbs: `watch`, `positions`, `scan`, `audit` | `scripts/cli.py` |
 
 **Evidence — live opportunity scan:**
 
@@ -48,31 +50,53 @@ $ defi-strategist watch --config examples/rules/stablecoin-yield-watch.yaml --it
 # Kamino / USDC @ 6.47%, Morpho / Gauntlet DAI Core @ 5.66%
 ```
 
+**Evidence — write-action pipeline (v0.1.5):**
+
+```sh
+# Three-stage progression, each gated by an explicit flag:
+$ defi-strategist watch --config rules.yaml --iterations 1
+# (default: monitor — actions inert)
+
+$ defi-strategist watch --config rules.yaml --address $W --dry-run-actions
+# (build calldata, do NOT broadcast — safety smoke test)
+
+$ defi-strategist watch --config rules.yaml --address $W --live
+# (broadcast via wallet contract-call)
+```
+
 ---
 
 ## 2. Risk control framework
 
-Risk in DeFi looks different from risk in spot trading. Spot risk =
-sudden price drops. DeFi risk = yield decay (APY falls below opportunity
-cost), concentration drift (one protocol silently eats your portfolio),
-and rotation latency (a better product appeared, you didn't notice).
-v0.1 directly addresses all three.
+Risk in DeFi has two shapes:
+- **Yield risk** — yields decay (APY falls), concentration drifts (one
+  protocol silently eats the portfolio), rotation latency (a better
+  product exists and you didn't notice).
+- **Action risk** — once write actions are wired in, an misfiring rule
+  could drain gas or move funds incorrectly. Three explicit safety
+  gates address this.
 
 | Control | Where | Why it matters |
 |---|---|---|
 | `min_apy_floor` rule | `scripts/rules.py` | Catches yields that decay below the user's reservation rate |
 | `max_protocol_concentration` rule | `scripts/rules.py` | Single-protocol blow-up risk (e.g. a lending platform hack) |
 | `opportunity_above` rule | `scripts/rules.py` | Catches the *cost* of inaction — money sitting at 3% when 7% is available |
-| Per-cycle error capture (positions fetch failed, search failed) | `scripts/watch.py` | Failures don't kill the loop; subsequent cycles retry |
-| Adapter timeouts + auth error normalization (`wallet_not_logged_in`) | `scripts/onchain_defi.py` | Operators get a clear error instead of a stack trace |
-| Read-only by design in v0.1 | core architecture | Can't accidentally drain a position; safe to run against any wallet |
+| **Default-inert actions** — without `--live`, actions are recorded only, never sent to OnChainOS | `scripts/cli.py:cmd_watch` | Most powerful safety guard: a misconfigured rules file can't move funds |
+| **`--dry-run-actions`** — build calldata via OnChainOS but DO NOT broadcast | `scripts/cli.py`, `scripts/executor.py:dry_run` | Smoke-test that calldata is well-formed before the first live run |
+| **`--max-actions-per-cycle`** — cap actions per cycle (default 5) | `scripts/watch.py` | A rule that misfires emitting 100 actions still spends at most N gas units per cycle |
+| `--live` REQUIRES `--address` — fails fast | `scripts/cli.py:cmd_watch` | Refuses to construct an executor without explicit wallet context |
+| `min_rewards_usd` floor on `auto_compound` — won't claim below threshold | `scripts/rules.py:_auto_compound` | Protects against silly-small claims where gas exceeds reward |
+| Per-cycle error capture; per-action error short-circuits the batch | `scripts/watch.py` | One failing action doesn't cascade through the rest of a cycle |
+| Adapter timeouts + auth error normalization (`wallet_not_logged_in`) | `scripts/onchain_defi.py`, `scripts/executor.py` | Operators get a clear error instead of a stack trace |
 
 ---
 
 ## 3. Execution reliability
 
-v0.1 is read-only — no on-chain writes — so "execution" here means the
-*data plumbing* doesn't lose its mind under real-world conditions.
+v0.1.5 has both a read and a write path. Both share the same
+subprocess-wrapper safety story.
+
+### Read path (always active)
 
 | What | Where |
 |---|---|
@@ -81,7 +105,18 @@ v0.1 is read-only — no on-chain writes — so "execution" here means the
 | Response-shape normalization across endpoints (`investmentList` / `list` / `items` variants) | `scripts/onchain_defi.py:_extract_list` |
 | Position flattening that handles empty (`assetStatus: 1`), nested, and platform-list response shapes | `scripts/watch.py:_flatten_positions` |
 | APY ratio → percent conversion at adapter boundary, so rules use stable units | `scripts/onchain_defi.py:_pct` |
-| Auth error mapped to `wallet_not_logged_in` for operator clarity | `scripts/onchain_defi.py:_run` |
+
+### Write path (--live / --dry-run-actions)
+
+| What | Where |
+|---|---|
+| Two-step pipeline: `defi {claim,invest}` → `wallet contract-call` | `scripts/executor.py:_build_and_submit` |
+| Solana / EVM dispatch — uses `--unsigned-tx` for SOL, `--input-data` for EVM, automatically | `scripts/executor.py:_submit_argv` |
+| `_extract_submit_fields` handles flat, nested-under-txData/transaction, and list-of-txs response shapes | `scripts/executor.py` |
+| `_extract_tx_hash` covers `txHash`, `transactionHash`, `orderId`, `hash` variants | `scripts/executor.py` |
+| Auth error mapped to `wallet_not_logged_in` (same vocabulary as read path) | `scripts/executor.py:_run` |
+| Refuses to submit if `to` is missing for EVM input_data, or if neither `input_data` nor `unsigned_tx` was extracted | `scripts/executor.py` |
+| **26 tests** covering rules + adapter + executor argv construction — all green | `tests/` |
 
 **Evidence:** the live scan returns 26 opportunities across 3 stablecoins
 on Solana+Ethereum in a single cycle, normalized into a stable shape and
@@ -94,7 +129,7 @@ sorted by APY. See README.md quickstart for the reproducible command.
 | What | Where |
 |---|---|
 | Quickstart in README: 4 commands from auth → scan → watch → audit | `README.md` |
-| **Read-only v0.1** — there is no `--live` flag; you cannot accidentally move funds. Write actions are explicitly deferred to v0.2 with the design sketched in README roadmap | core architecture |
+| **Three-stage opt-in progression** — monitor (default) → `--dry-run-actions` (build but don't broadcast) → `--live` (broadcast). Each stage is opt-in via an explicit flag; no implicit upgrades. | `scripts/cli.py:cmd_watch` |
 | `OKX_API_KEY` / `OKX_SECRET_KEY` / `OKX_PASSPHRASE` read by underlying `onchainos` CLI only — `defi-strategist` never reads, logs, or persists secrets (grep verified) | `scripts/onchain_defi.py` (no env var reads) |
 | Plugin manifest for skill registry | `plugin.yaml` |
 | Clear error vocabulary: `cli_not_found`, `cli_timeout`, `wallet_not_logged_in`, `cli_error`, `cli_output_invalid`, `api_error`, `rules_not_found` | `scripts/onchain_defi.py`, `scripts/cli.py` |
