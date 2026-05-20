@@ -20,7 +20,9 @@ import yaml
 
 from . import audit as audit_mod
 from . import watch
+from .discoverer import discover_loops
 from .executor import DefiExecutor
+from .loop_executor import LoopExecutor
 from .onchain_defi import DefiAdapter, DefiError, normalize_product
 
 EXIT_OK = 0
@@ -47,7 +49,8 @@ def _wrap(handler: Callable[..., int]) -> Callable[..., int]:
         except DefiError as e:
             return _failed(f"defi_error {e}")
         except Exception as e:  # noqa: BLE001
-            return _failed(f"internal_error {type(e).__name__}: {e}")
+            import traceback
+            return _failed(f"internal_error {type(e).__name__}: {e}\n{traceback.format_exc()}")
 
     return _w
 
@@ -171,6 +174,75 @@ def cmd_audit(args: argparse.Namespace) -> int:
     return _ok({"count": len(events), "events": events})
 
 
+@_wrap
+def cmd_discover(args: argparse.Namespace) -> int:
+    chains = _split_csv(args.chains)
+    if not chains:
+        return _failed("discover_requires_chains")
+    adapter = DefiAdapter(cache_ttl_sec=0)
+    loops = discover_loops(
+        base_asset=args.token,
+        chains=chains,
+        adapter=adapter,
+        min_tvl_usd=args.min_tvl,
+        min_step_apy_pct=args.min_step_apy,
+        include_single_step=not args.composed_only,
+        include_2step=not args.single_step_only,
+    )
+    sliced = loops[: args.top] if args.top is not None else loops
+    return _ok({
+        "count_total": len(loops),
+        "count_returned": len(sliced),
+        "loops": [lp.as_dict() for lp in sliced],
+    })
+
+
+@_wrap
+def cmd_run_loop(args: argparse.Namespace) -> int:
+    chains = _split_csv(args.chains)
+    if not chains:
+        return _failed("run_loop_requires_chains")
+    if len(chains) != 1:
+        return _failed("run_loop_single_chain — pass exactly one chain (loops are intra-chain in v0.2)")
+    adapter = DefiAdapter(cache_ttl_sec=0)
+    # Permissive filters so any loop_id surfaced by a prior `discover`
+    # invocation is also findable here. The user already vetted the
+    # loop; we shouldn't second-guess by re-applying tight filters.
+    loops = discover_loops(
+        base_asset=args.token,
+        chains=chains,
+        adapter=adapter,
+        min_tvl_usd=0.0,
+        min_step_apy_pct=0.0,
+    )
+    target = next((lp for lp in loops if lp.loop_id == args.loop_id), None)
+    if target is None:
+        return _failed(
+            f"loop_not_found loop_id={args.loop_id!r} — "
+            f"re-run `discover --token {args.token} --chains {chains[0]}` "
+            "to refresh the loop list (id is stable across runs but the "
+            "loop must still exist in the current opportunity set)"
+        )
+    executor = DefiExecutor(
+        address=args.address,
+        chain=chains[0],
+        dry_run=not args.live,
+    )
+    loop_executor = LoopExecutor(
+        loop=target,
+        executor=executor,
+        adapter=adapter,
+        poll_interval_sec=args.poll_interval,
+        poll_timeout_sec=args.poll_timeout,
+    )
+    fill = loop_executor.run(amount_minimal_units=args.amount_minimal_units)
+    return _ok({
+        "loop": target.as_dict(),
+        "fill": fill.as_dict(),
+        "mode": "live" if args.live else "dry-run-actions",
+    })
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="defi-strategist",
@@ -179,7 +251,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Monitor positions, scan opportunities, fire alerts on rules."
         ),
     )
-    p.add_argument("--version", action="version", version="defi-strategist 0.1.5")
+    p.add_argument("--version", action="version", version="defi-strategist 0.2.0")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     wa = sub.add_parser("watch", help="Run the monitor loop")
@@ -237,6 +309,38 @@ def build_parser() -> argparse.ArgumentParser:
     au = sub.add_parser("audit", help="Print recent audit log lines")
     au.add_argument("--limit", type=int, default=20)
     au.set_defaults(_handler=cmd_audit)
+
+    di = sub.add_parser(
+        "discover",
+        help="Find composable yield loops starting from a base asset",
+    )
+    di.add_argument("--token", required=True, help="Base asset (e.g. USDC, SOL, ETH)")
+    di.add_argument("--chains", required=True, help="Comma-separated chains")
+    di.add_argument("--top", type=int, default=10, help="Limit results to top N by combined APY")
+    di.add_argument("--min-tvl", type=float, default=100_000.0, dest="min_tvl", help="Per-step TVL floor (default $100k)")
+    di.add_argument("--min-step-apy", type=float, default=0.5, dest="min_step_apy", help="Per-step minimum APY %% (default 0.5)")
+    di.add_argument("--composed-only", action="store_true", help="Show only 2+ step compositions")
+    di.add_argument("--single-step-only", action="store_true", help="Show only single-step opportunities")
+    di.set_defaults(_handler=cmd_discover)
+
+    rl = sub.add_parser(
+        "run-loop",
+        help="Execute a discovered loop (default: --dry-run-actions; pass --live to broadcast)",
+    )
+    rl.add_argument("--loop-id", required=True, dest="loop_id", help="Loop id from `discover` output")
+    rl.add_argument("--token", required=True, help="Same --token used in the matching discover call")
+    rl.add_argument("--chains", required=True, help="Same --chains; exactly one chain (loops are intra-chain in v0.2)")
+    rl.add_argument("--address", required=True)
+    rl.add_argument(
+        "--amount-minimal-units",
+        required=True,
+        dest="amount_minimal_units",
+        help="Amount of the base asset in minimal units (e.g. '1000000' = 1 USDC at 6 decimals)",
+    )
+    rl.add_argument("--live", action="store_true", help="Broadcast on-chain (default: dry-run, calldata only)")
+    rl.add_argument("--poll-interval", type=float, default=5.0, dest="poll_interval", help="Seconds between receipt-balance polls in --live multi-step")
+    rl.add_argument("--poll-timeout", type=float, default=60.0, dest="poll_timeout", help="Seconds to wait for step-1 receipt balance before skipping step 2")
+    rl.set_defaults(_handler=cmd_run_loop)
 
     return p
 

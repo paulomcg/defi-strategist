@@ -1,11 +1,13 @@
 name: defi-strategist
-version: 0.1.5
+version: 0.2.0
 description: >
-  Strategy + observability layer over OnChainOS DeFi primitives. Monitors
-  user DeFi positions, scans yield opportunities, fires structured alerts
-  on user-defined rules. v0.1.5 adds auto-compound write actions
-  (claim + reinvest) via `defi claim` + `wallet contract-call`, with
-  --live / --dry-run-actions safety gates.
+  Strategy + observability layer over OnChainOS DeFi primitives.
+  v0.2 adds COMPOSABLE LOOP DISCOVERY (`discover` enumerates 1- and
+  2-step yield loops across protocols, e.g. SOL → Marinade → mSOL →
+  Solayer restake) and on-demand loop execution (`run-loop` drives the
+  full sequence via the same --live / --dry-run-actions safety gates).
+  Includes opportunity scanning, position monitoring, alert rules,
+  auto-compound, and the loop discoverer/executor.
 author: paulomcg
 license: MIT
 entrypoint: ./bin/defi-strategist

@@ -232,6 +232,10 @@ class DefiExecutor:
         return argv
 
     def _run(self, argv: list[str]) -> dict[str, Any]:
+        # Coerce all argv elements to str — investment_id and other ids
+        # may arrive as int from the OnChainOS adapter; subprocess.run
+        # rejects non-string argv elements with an opaque TypeError.
+        argv = [str(a) for a in argv]
         try:
             res = subprocess.run(
                 [self.cli_bin, *argv],

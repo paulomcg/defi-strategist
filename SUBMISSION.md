@@ -4,7 +4,7 @@
 **Submitted by:** Paulo Goncalves
 **OnChainOS as primary data + trading source:** ✅ (every API call is a
 subprocess of `onchainos defi *`)
-**Status:** v0.1.5 — monitor + auto-compound write actions. Companion to
+**Status:** v0.2.0 — monitor + auto-compound + composable loop discovery + on-demand execution. Companion to
 [`portfolio-manager`](https://github.com/paulomcg/portfolio-manager)
 + [`strategy-backtester`](https://github.com/paulomcg/strategy-backtester)
 
@@ -31,8 +31,11 @@ actions to drive write operations.
 | `max_protocol_concentration` rule — alert when one platform exceeds X% of DeFi value | `scripts/rules.py:_max_concentration` |
 | `opportunity_above` rule — surface yield-rotation candidates not already held | `scripts/rules.py:_opportunity_above` |
 | `auto_compound` rule — emit `claim` (and optional `reinvest`) actions when pending rewards exceed threshold | `scripts/rules.py:_auto_compound` |
+| Composable loop discoverer — enumerate 1- and 2-step yield compositions across protocols (LST → restake patterns) | `scripts/discoverer.py:discover_loops` |
+| Receipt-token map — curated (chain, platform, deposit) → receipt mappings for Solana / Ethereum / Base LSTs | `scripts/composability.py` |
+| Loop executor with receipt-balance polling between steps in live mode | `scripts/loop_executor.py` |
 | Three example rule configs: scan-only, portfolio-health, auto-compound | `examples/rules/` |
-| Four CLI verbs: `watch`, `positions`, `scan`, `audit` | `scripts/cli.py` |
+| Six CLI verbs: `watch`, `positions`, `scan`, `audit`, `discover`, `run-loop` | `scripts/cli.py` |
 
 **Evidence — live opportunity scan:**
 
@@ -62,6 +65,22 @@ $ defi-strategist watch --config rules.yaml --address $W --dry-run-actions
 
 $ defi-strategist watch --config rules.yaml --address $W --live
 # (broadcast via wallet contract-call)
+```
+
+**Evidence — loop discovery on real OnChainOS data:**
+
+```sh
+$ defi-strategist discover --token SOL --chains solana --top 5 --min-step-apy 0 --composed-only
+# returns 4 real 2-step LST→restake compositions on Solana:
+#   [4b8b976e] combined=6.20%  Marinade Finance[SOL→mSOL] → Solayer[mSOL→mSOL]
+#   [890b64a1] combined=5.62%  Jito[SOL→JitoSOL] → Solayer[JitoSOL→JitoSOL]
+#   [96bf0c41] combined=5.26%  Kamino/Jito Pool[SOL→JitoSOL] → Solayer[JitoSOL→JitoSOL]
+#   [5a044dcb] combined=4.89%  Kamino/Marinade Pool[SOL→mSOL] → Solayer[mSOL→mSOL]
+
+$ defi-strategist run-loop --loop-id 4b8b976e9880 --token SOL --chains solana \
+    --address $W --amount-minimal-units 1000000
+# dry-run-actions by default: builds calldata for both steps via OnChainOS,
+# completed=True, submitted_count=0, fills=[Marinade step, Solayer step]
 ```
 
 ---
@@ -116,7 +135,10 @@ subprocess-wrapper safety story.
 | `_extract_tx_hash` covers `txHash`, `transactionHash`, `orderId`, `hash` variants | `scripts/executor.py` |
 | Auth error mapped to `wallet_not_logged_in` (same vocabulary as read path) | `scripts/executor.py:_run` |
 | Refuses to submit if `to` is missing for EVM input_data, or if neither `input_data` nor `unsigned_tx` was extracted | `scripts/executor.py` |
-| **26 tests** covering rules + adapter + executor argv construction — all green | `tests/` |
+| Loop executor polls `defi positions` between steps to get the actual receipt-token balance, protects against step-1 partial-fill over-deposit in step 2 | `scripts/loop_executor.py:_wait_for_receipt` |
+| Self-loop filter — step 2 can't be the same investment_id as step 1 | `scripts/discoverer.py` |
+| Combined APY is the naive sum and labeled as such — every multi-step loop carries a `notes` field stating it's an upper bound | `scripts/discoverer.py:_mk_loop` |
+| **42 tests** covering rules + adapter + executor + composability map + discoverer — all green | `tests/` |
 
 **Evidence:** the live scan returns 26 opportunities across 3 stablecoins
 on Solana+Ethereum in a single cycle, normalized into a stable shape and
