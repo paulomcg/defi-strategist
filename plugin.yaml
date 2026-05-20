@@ -1,30 +1,32 @@
+schema_version: 1
 name: defi-strategist
-version: 0.3.0
-description: >
-  Strategy + observability layer over OnChainOS DeFi primitives.
-  v0.3 ships full DYNAMIC GRAPH DISCOVERY (builds a token-edge graph
-  from `defi detail` lpToken/underlyingToken — no hardcoded receipt
-  map needed), RISK SCORING (APY volatility + TVL stability via
-  `rate-chart` + `tvl-chart`), N-step LOOP EXECUTION with receipt-
-  balance polling between steps, and ROLLBACK on partial failure
-  (best-effort `defi redeem` walk-back of completed legs). Includes
-  opportunity scanning, position monitoring, alert rules,
-  auto-compound, and all v0.2 capabilities.
-author: paulomcg
+version: "0.3.0"
+description: "Strategy + observability layer over OnChainOS DeFi primitives. v0.3 ships dynamic graph discovery (builds a token-edge graph from `defi detail` lpToken/underlyingToken fields — no hardcoded protocol map needed), risk scoring (APY volatility + TVL stability via `rate-chart` + `tvl-chart` history), N-step loop execution with receipt-balance polling between steps, and best-effort rollback on partial failure (walks back through completed legs emitting `defi redeem` calldata). Six CLI verbs: scan (cross-chain yield discovery), positions (wallet snapshot), discover (loop enumeration with optional --with-risk scoring), run-loop (execute discovered composition with --live / --dry-run-actions safety gates), watch (continuous monitor with declarative rules including auto_compound), audit (replay event log). Three-stage opt-in safety progression for write actions. Trigger phrases: find yield loops, discover DeFi strategies, composable yield, auto-compound, claim and reinvest, monitor DeFi positions, scan yields, risk score, weakest link, multi-step deposit, LST restake, Marinade Solayer, Jito Solayer, Lido Aave, yield rotation, rollback, defi audit."
+author:
+  name: "Paulo Goncalves"
+  github: "paulomcg"
 license: MIT
-entrypoint: ./bin/defi-strategist
-runtime: python3
-requires:
-  - onchainos
-python_packages:
-  - pyyaml
+category: defi-strategy
 tags:
+  - solana
+  - ethereum
+  - base
+  - onchainos
   - defi
   - yield
+  - composable-loops
+  - lst-restaking
+  - auto-compound
+  - risk-scoring
+  - dynamic-graph
   - monitoring
-  - observability
-  - okx-onchainos
-links:
-  source: https://github.com/paulomcg/defi-strategist
-  companion_portfolio_manager: https://github.com/paulomcg/portfolio-manager
-  companion_backtester: https://github.com/paulomcg/strategy-backtester
+  - rollback
+  - portfolio-manager
+  - composes-with-pm
+
+components:
+  skill:
+    dir: .
+
+api_calls: []
+type: community-developer

@@ -1,3 +1,13 @@
+---
+name: defi-strategist
+description: "Strategy + observability layer over OnChainOS DeFi primitives. Discovers composable yield loops dynamically from `defi detail`'s lpToken/underlyingToken fields (no hardcoded protocol map needed), scores each loop's risk from real APY-volatility + TVL-stability history (`rate-chart` / `tvl-chart`), and executes multi-step compositions with receipt-balance polling between steps + best-effort rollback on partial failure. Three-stage safety: monitor (default, inert) → --dry-run-actions (build calldata, do not broadcast) → --live (broadcast via wallet contract-call). Use when the user says: find DeFi yield loops, discover composable strategies, run a yield loop, auto-compound rewards, monitor DeFi positions, scan yields across chains, risk-score yield opportunities, claim and reinvest, multi-step deposit, LST restake, Marinade Solayer, Jito Solayer, Lido Aave, yield rotation."
+version: "0.3.0"
+license: MIT
+metadata:
+  author: paulomcg
+  homepage: "https://github.com/paulomcg/defi-strategist"
+---
+
 # defi-strategist SKILL.md
 
 Strategy + observability layer over OnChainOS DeFi primitives. Wraps

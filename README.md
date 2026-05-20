@@ -131,6 +131,30 @@ Five things v0.2 does:
    comparison. No multi-step (3+ leg) loops. No dashboard. The
    architecture supports all; the roadmap below tracks which is next.
 
+## Install
+
+```sh
+git clone https://github.com/paulomcg/defi-strategist.git ~/Projects/defi-strategist
+cd ~/Projects/defi-strategist && ./install.sh
+echo 'export PATH="$HOME/Projects/defi-strategist/bin:$PATH"' >> ~/.bashrc  # or .zshrc
+defi-strategist --version
+```
+
+### Using this skill from an agent (Claude / Codex / etc.)
+
+| Method | Path |
+|---|---|
+| Drop into Claude Code's skills dir | `cp -r . ~/.claude/skills/defi-strategist/` then restart Claude |
+| Point a custom agent at the SKILL.md | parse YAML frontmatter (name / description / trigger phrases); shell out to `bin/defi-strategist` per command |
+| Register with the OKX Plugin Store | `plugin.yaml` carries the manifest (schema_version: 1) |
+
+Every CLI command emits `{"ok": bool, "result": {...}}` JSON envelopes
+on stdout (with `--format json`, the default). For direct human use,
+pass `--format table` for fixed-width readable output. Errors print
+`FAILED: <category> <detail>` to stderr — categories are stable +
+machine-parseable. See `SKILL.md` for the full schema, error
+vocabulary, and programmatic embedding examples.
+
 ## Quickstart
 
 ```sh
