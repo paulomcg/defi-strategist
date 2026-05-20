@@ -26,6 +26,17 @@ from . import audit, rules as rules_engine
 from .executor import DefiExecutor, DefiExecutorError
 from .onchain_defi import DefiAdapter, DefiError, normalize_product
 
+# Optional formatter for per-cycle output. None = JSONL (default,
+# backwards compatible). When set to "table", the loop emits a
+# concise human-readable line per cycle instead.
+_CYCLE_FORMAT = "json"
+
+
+def set_cycle_format(fmt: str) -> None:
+    """Module-level switch consumed by run_monitor's emission path."""
+    global _CYCLE_FORMAT
+    _CYCLE_FORMAT = fmt
+
 _DEFAULT_INTERVAL = 60
 
 
@@ -163,7 +174,10 @@ def run_monitor(
                     if fill.get("submitted"):
                         submitted_total += 1
 
-            sink.write(json.dumps(cycle, default=str) + "\n")
+            if _CYCLE_FORMAT == "table":
+                sink.write(_format_cycle_line(cycle) + "\n")
+            else:
+                sink.write(json.dumps(cycle, default=str) + "\n")
             sink.flush()
             audit.append({"event": "monitor.cycle", **cycle})
             cycles += 1
@@ -188,6 +202,31 @@ def run_monitor(
     }
     audit.append({"event": "monitor.end", **summary})
     return summary
+
+
+def _format_cycle_line(cycle: dict[str, Any]) -> str:
+    """One-line per-cycle summary for --format table mode. Surfaces
+    only what an operator scanning the output needs: cycle index,
+    counts, top alerts. Full detail still lands in the audit log."""
+    n_pos = len(cycle.get("positions") or [])
+    n_opps = cycle.get("opportunities_count", 0)
+    n_alerts = len(cycle.get("alerts") or [])
+    n_actions = len(cycle.get("actions") or [])
+    n_fills = len(cycle.get("fills") or [])
+    n_errors = len(cycle.get("errors") or [])
+    head = (
+        f"cycle {cycle.get('cycle_index', '?')}: "
+        f"positions={n_pos} opps={n_opps} alerts={n_alerts} "
+        f"actions={n_actions} fills={n_fills} errors={n_errors}"
+    )
+    parts = [head]
+    for a in (cycle.get("alerts") or [])[:5]:
+        parts.append(
+            f"  [{a.get('severity','?'):4s}] {a.get('kind','?')}: {a.get('message','')[:90]}"
+        )
+    for e in (cycle.get("errors") or [])[:3]:
+        parts.append(f"  ERR [{e.get('kind','?')}] {str(e.get('detail',''))[:90]}")
+    return "\n".join(parts)
 
 
 def _execute_action(executor: DefiExecutor, action) -> dict[str, Any]:

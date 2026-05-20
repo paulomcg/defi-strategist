@@ -424,6 +424,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     _OUTPUT_FORMAT = getattr(args, "format", "json")
     _CURRENT_COMMAND = getattr(args, "cmd", "")
+    # Propagate format to the watch loop's per-cycle emission path
+    # (the streaming output bypasses _ok and needs to be informed).
+    watch.set_cycle_format(_OUTPUT_FORMAT)
     handler = getattr(args, "_handler", None)
     if handler is None:
         parser.error("no handler for this command")
