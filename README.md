@@ -133,21 +133,6 @@ misfiring rule can't burn budget through hundreds of round-trips.
 
 ---
 
-### Integration paths (Claude Code, Codex, custom agents)
-
-| Method | Path |
-|---|---|
-| Drop into Claude Code's skills dir | `cp -r . ~/.claude/skills/defi-strategist/` then restart Claude |
-| Point a custom agent at SKILL.md | parse YAML frontmatter; shell out to `bin/defi-strategist` per command |
-| Register with the OKX Plugin Store | `plugin.yaml` schema_version: 1 |
-
-Every command emits `{"ok": bool, "result": {...}}` JSON on stdout
-(default, agent-friendly). Pass `--format table` for human-readable
-output during direct CLI use. Errors print `FAILED: <category>
-<detail>` to stderr with stable machine-parseable categories.
-
----
-
 ## Install
 
 ```sh
@@ -166,6 +151,19 @@ export OKX_API_KEY=... OKX_SECRET_KEY=... OKX_PASSPHRASE=...
 
 `defi-strategist` itself never reads those env vars — only the
 underlying `onchainos` CLI does.
+
+### Wiring into an agent (Claude Code, Codex, custom harness)
+
+| Method | Path |
+|---|---|
+| Drop into Claude Code's skills dir | `cp -r . ~/.claude/skills/defi-strategist/` then restart Claude |
+| Point a custom agent at SKILL.md | parse YAML frontmatter; shell out to `bin/defi-strategist` per command |
+| Register with the OKX Plugin Store | `plugin.yaml` schema_version: 1 |
+
+Every command emits `{"ok": bool, "result": {...}}` JSON on stdout
+(default, agent-friendly). Pass `--format table` for human-readable
+output during direct CLI use. Errors print `FAILED: <category>
+<detail>` to stderr with stable machine-parseable categories.
 
 ---
 
