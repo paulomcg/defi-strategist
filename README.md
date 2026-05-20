@@ -12,118 +12,66 @@ partial failure. `defi-strategist` is that driver.
 
 ---
 
-## What you can do with it
+## What you can ask the agent to do
 
-### Find the best yield for a stablecoin across chains
+Natural-language prompts and what the agent does with them:
 
-```sh
-defi-strategist --format table scan \
-  --tokens USDC,USDT --chains solana,ethereum,base --top 10
-```
+### "Where should I park my idle USDC right now?"
 
-```
-opportunity scan — 10 products:
+Agent scans every USDC-accepting product across Solana, Ethereum,
+and Base via OnChainOS, ranks by APY, dedups across protocols, and
+shows the user the top opportunities side-by-side. Kamino Main Pool
+at 7.41%, Syrup at 4.88%, Aave V3 at 3.83% — the agent surfaces all
+of them and lets the user pick.
 
-  platform               name                  apy             tvl
-  ---------------------- -------------------- ------  --------------
-  Kamino / Main Pool     USDC                  7.41%  $ 149,236,776
-  Kamino                 USDC                  6.45%  $  32,117,289
-  Syrup                  USDC                  4.88%  $1,395,711,039
-  Jupiter                USDC                  4.72%  $ 449,002,741
-  Fluid                  USDC                  4.65%  $ 201,515,883
-  Spark / Main Pool      USDC                  4.55%  $  36,189,449
-  Compound V3            USDC                  4.44%  $  10,375,118
-  Morpho                 Steakhouse Prime USD  4.41%  $ 465,979,664
-  Aave V3                USDC                  3.83%  $2,032,163,029
-  Syrup                  USDT                  4.43%  $ 388,160,999
-```
+### "Find me a composable yield loop on SOL and tell me which is safest"
 
-### Discover composable yield loops + score them by risk
+Agent dynamically builds a token-edge graph from OnChainOS DeFi
+data, walks it up to 3 steps deep, surfaces every loop starting
+from SOL — both single-product yields AND multi-step compositions
+(Marinade → Solayer restake, Jito → Solayer, etc.). With risk
+scoring on, each loop gets a 0-100 score derived from real APY
+volatility + TVL stability history.
 
-```sh
-defi-strategist --format table discover \
-  --token SOL --chains solana \
-  --max-steps 3 --top 8 --with-risk
-```
+Marinade at 6.20% scores **98.3/100** (rock-steady APY history).
+Kamino's top APY at 9.36% scores **29.2/100** (volatile). The agent
+shows the trade-off and lets the user choose between APY and
+trustworthiness, not just chase the biggest number.
 
-```
-discover — mode=dynamic-graph  graph: 8 tokens / 11 edges  loops: 8 (of 11 found)
+### "Run that Marinade → Solayer loop with 0.1 SOL"
 
-  loop_id     risk     apy steps  composition
-  ------------------------------------------------------------------------------
-  6e9135f22c  29.2   9.36%     1  Kamino[SOL→LP] 9.36%
-  4a818a8f1a  57.4   7.26%     1  Kamino[SOL→LP] 7.26%
-  0a3c007064  98.3   6.20%     1  Marinade Finance[SOL→mSOL] 6.20%
-  4b8b976e98  50.0   6.20%     2  Marinade Finance[SOL→mSOL] 6.20% → Solayer[mSOL→smSOL] 0.00%
-  2ba6dd8315  85.3   6.18%     1  Kamino[SOL→LP] 6.18%
-  6b1562f24a  92.2   5.61%     1  Jito[SOL→JitoSOL] 5.61%
-  890b64a1df  50.0   5.61%     2  Jito[SOL→JitoSOL] 5.61% → Solayer[JitoSOL→sjitoSOL] 0.00%
-  212a781032  61.9   5.27%     1  Kamino[SOL→LP] 5.27%
+Agent dry-runs first by default — builds the calldata for both
+legs via OnChainOS, shows the user what's about to be broadcast,
+no funds move. Once the user confirms, the agent re-runs with
+`--live`. The executor broadcasts step 1, polls the on-chain
+mSOL balance until it confirms, then uses the ACTUAL received
+amount (not the user's estimate) for step 2's Solayer deposit.
+If step 2 fails, the executor walks back through completed legs
+and emits best-effort redeem calldata to exit the intermediate
+position.
 
-  risk: 0-100, higher = safer (weakest-link of per-step APY volatility + TVL stability)
-```
+### "Auto-compound my rewards weekly when they exceed $10"
 
-The agent has surfaced both single-product yields AND the
-"LST-then-restake" compositions Solana is famous for. **Marinade
-scores 98.3/100** (very stable APY history) — that's a strong
-risk-adjusted pick at 6.20%. **Kamino's top APY at 9.36% scores
-29.2/100** — much more volatile, much less trustworthy. The user
-chooses; the agent shows the trade-off honestly.
-
-The receipt-token names (`smSOL`, `sjitoSOL`) were derived live from
-OnChainOS `defi detail`'s `lpToken` field — nothing is hardcoded.
-
-### Execute a discovered loop in dry-run, then live
-
-Pick a `loop_id` from the discover output, then:
-
-```sh
-# DRY-RUN: build calldata via OnChainOS, do NOT broadcast
-defi-strategist run-loop \
-  --loop-id 4b8b976e98 --token SOL --chains solana \
-  --address <your-solana-address> \
-  --amount-minimal-units 1000000     # 0.001 SOL
-```
-
-```
-run-loop — mode=dry-run-actions  2-step loop, combined APY 6.2%
-  result: completed=True fills=2 submitted=0
-
-  steps:
-    [1] Marinade Finance   SOL      → mSOL     APY  6.20%  submitted=no
-    [2] Solayer            mSOL     → mSOL     APY  0.00%  submitted=no
-        note: dry-run: step2 uses base amount as placeholder
-```
-
-Once the calldata looks right, broadcast:
-
-```sh
-defi-strategist run-loop \
-  --loop-id 4b8b976e98 --token SOL --chains solana \
-  --address <your-solana-address> \
-  --amount-minimal-units 1000000 \
-  --live
-```
-
-In `--live` mode the executor:
-1. Broadcasts step 1 via `wallet contract-call`
-2. Polls `defi positions` for the receipt-token balance (e.g., mSOL)
-3. Uses the **actual on-chain balance** for step 2's deposit amount
-   (not the user-supplied estimate — protects against partial-fill
-   over-deposit)
-4. Broadcasts step 2
-5. On any step failure, walks back through completed legs in reverse
-   and emits best-effort `defi redeem` calldata for each to exit the
-   intermediate positions. Rollback fills are recorded separately so
-   the operator can distinguish forward progress from cleanup.
-
-### Continuously monitor a wallet for yield rotation opportunities
+User-authored rule:
 
 ```yaml
-# portfolio-health.yaml
-name: portfolio-health
-chains: [solana, ethereum, base]
-watch_tokens: [USDC, USDT, SOL, ETH]
+rules:
+  - id: compound
+    type: auto_compound
+    min_rewards_usd: 10
+    reinvest: true
+```
+
+Agent points `defi-strategist watch` at the wallet + rule. Every
+cycle the rule fires if pending rewards > $10, the executor builds
+a `claim` calldata (and a `reinvest` follow-up if rewards came back
+as the underlying token), and `wallet contract-call` signs +
+broadcasts via the Agentic Wallet's TEE-backed signer. The simplest
+non-trivial DeFi loop, fully unattended.
+
+### "Watch my DeFi positions and alert me if any yield drops below 3%"
+
+```yaml
 rules:
   - id: yields-falling
     type: min_apy_floor
@@ -133,52 +81,26 @@ rules:
     type: max_protocol_concentration
     threshold_pct: 50.0
     severity: warn
-  - id: better-yield-elsewhere
-    type: opportunity_above
-    threshold_pct: 8.0
-    severity: info
 ```
 
-```sh
-defi-strategist watch --config portfolio-health.yaml \
-  --address <your-wallet> --interval 3600
-```
+Agent starts a continuous monitor — no on-chain actions, just polls
+positions + opportunities and fires alerts to the audit log when any
+rule trips. The agent can come back later and ask "any new alerts?"
+or "what changed overnight?" by tailing the audit.
 
-Polls positions + opportunities every hour, fires structured alerts
-to stdout AND an append-only audit log when any rule trips. The agent
-can come back later and pull the audit:
+### "Is there a better yield for my existing position anywhere?"
 
-```sh
-defi-strategist --format table audit --limit 10
-```
+Rule type `opportunity_above` watches a list of tokens, surfaces
+products on those tokens above an APY threshold that the user
+doesn't already hold. Agent gets a structured alert: "Morpho
+Steakhouse Prime USD at 8.2% beats your current Kamino USDC at
+6.45% — want me to rotate?"
 
-### Auto-compound rewards across positions
+### "Stop everything immediately — I need to think"
 
-```yaml
-# auto-compound.yaml
-name: auto-compound
-chains: [solana]
-rules:
-  - id: compound-pending-rewards
-    type: auto_compound
-    min_rewards_usd: 5.0     # don't bother claiming if rewards < $5 (gas)
-    reinvest: true           # claim + redeposit
-```
-
-```sh
-# Dry-run first (build the calldata, don't broadcast)
-defi-strategist watch --config auto-compound.yaml \
-  --address <your-wallet> --dry-run-actions --interval 3600
-
-# Then go live
-defi-strategist watch --config auto-compound.yaml \
-  --address <your-wallet> --live --interval 3600
-```
-
-When pending rewards exceed `min_rewards_usd`, the rule emits a
-`claim` action (and a `reinvest` follow-up if configured). The
-executor builds the calldata via `defi claim` + `defi invest` and
-submits via `wallet contract-call`.
+Agent kills the watch process. Without `--live` no on-chain action
+fires anyway; with `--live`, the loop stops at the next interval
+boundary. There is no persisted "live mode on" state.
 
 ### Three-stage opt-in safety
 
@@ -191,7 +113,7 @@ submits via `wallet contract-call`.
 `--max-actions-per-cycle N` caps actions per cycle (default 5) so a
 misfiring rule can't burn budget through hundreds of round-trips.
 
-### Use it from Claude Code / Codex / a custom agent
+### Integration paths (Claude Code, Codex, custom agents)
 
 | Method | Path |
 |---|---|
@@ -201,8 +123,8 @@ misfiring rule can't burn budget through hundreds of round-trips.
 
 Every command emits `{"ok": bool, "result": {...}}` JSON on stdout
 (default, agent-friendly). Pass `--format table` for human-readable
-output. Errors print `FAILED: <category> <detail>` to stderr with
-stable machine-parseable categories.
+output during direct CLI use. Errors print `FAILED: <category>
+<detail>` to stderr with stable machine-parseable categories.
 
 ---
 
