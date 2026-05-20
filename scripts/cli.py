@@ -22,15 +22,24 @@ from . import audit as audit_mod
 from . import watch
 from .discoverer import attach_risk_scores, discover_loops, discover_loops_v3
 from .executor import DefiExecutor
+from .format import format_result
 from .loop_executor import LoopExecutor
 from .onchain_defi import DefiAdapter, DefiError, normalize_product
+
+# Set by main() before dispatch. Lets _ok() respect --format without
+# threading the arg through every handler.
+_OUTPUT_FORMAT = "json"
+_CURRENT_COMMAND = ""
 
 EXIT_OK = 0
 EXIT_FAILED = 1
 
 
 def _ok(result: Any) -> int:
-    print(json.dumps({"ok": True, "result": result}, default=str))
+    if _OUTPUT_FORMAT == "table":
+        print(format_result(command=_CURRENT_COMMAND, result=result))
+    else:
+        print(json.dumps({"ok": True, "result": result}, default=str))
     return EXIT_OK
 
 
@@ -273,10 +282,21 @@ def build_parser() -> argparse.ArgumentParser:
         prog="defi-strategist",
         description=(
             "Strategy/observability layer over OnChainOS DeFi primitives. "
-            "Monitor positions, scan opportunities, fire alerts on rules."
+            "Monitor positions, scan opportunities, fire alerts on rules, "
+            "discover composable loops, execute multi-step plans with rollback."
         ),
     )
     p.add_argument("--version", action="version", version="defi-strategist 0.3.0")
+    p.add_argument(
+        "--format",
+        choices=["json", "table"],
+        default="json",
+        help=(
+            "Output format. `json` (default) emits {ok, result} envelopes "
+            "for agent / script consumers. `table` emits human-readable "
+            "fixed-width tables for direct CLI use."
+        ),
+    )
     sub = p.add_subparsers(dest="cmd", required=True)
 
     wa = sub.add_parser("watch", help="Run the monitor loop")
@@ -399,8 +419,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    global _OUTPUT_FORMAT, _CURRENT_COMMAND
     parser = build_parser()
     args = parser.parse_args(argv)
+    _OUTPUT_FORMAT = getattr(args, "format", "json")
+    _CURRENT_COMMAND = getattr(args, "cmd", "")
     handler = getattr(args, "_handler", None)
     if handler is None:
         parser.error("no handler for this command")
